@@ -30,6 +30,20 @@ const path = require('node:path');
 const SRC = path.resolve(__dirname, '..', '..', '..', 'frontend', 'src');
 const FB = path.join(SRC, 'backend', 'firebase');
 
+/**
+ * This suite compares the frontend's Appwrite and Firebase error translators, which
+ * live in the separate frontend repo since the Firebase backend split
+ * (BACKEND_MIGRATION_PROGRESS.md). It cannot run meaningfully from this backend-only
+ * repo in isolation — skip cleanly rather than fail on a directory absent by design.
+ * Run from a checkout with both repos as siblings to get real parity coverage.
+ */
+if (!fs.existsSync(SRC)) {
+    test('error contract parity checks (SKIPPED — frontend/ is not part of this standalone backend repo)', (t) => {
+        t.skip('This repo is backend-only by design; these checks need the frontend repo as a sibling directory.');
+    });
+    return;
+}
+
 const errorsSource = fs.readFileSync(path.join(FB, 'errors.ts'), 'utf8');
 const coreErrorsSource = fs.readFileSync(path.join(SRC, 'backend', 'core', 'errors.ts'), 'utf8');
 

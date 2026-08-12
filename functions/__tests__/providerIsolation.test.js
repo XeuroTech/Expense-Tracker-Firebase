@@ -31,6 +31,21 @@ const path = require('node:path');
 
 const SRC = path.resolve(__dirname, '..', '..', '..', 'frontend', 'src');
 
+/**
+ * Every check in this suite reads the frontend's seam files, which live in the
+ * separate frontend repo since the Firebase backend split
+ * (BACKEND_MIGRATION_PROGRESS.md). It cannot run meaningfully from this
+ * backend-only repo in isolation — skip cleanly rather than fail on a directory
+ * absent by design. Run from a checkout with both repos as siblings to get real
+ * isolation coverage.
+ */
+if (!fs.existsSync(SRC)) {
+    test('provider isolation checks (SKIPPED — frontend/ is not part of this standalone backend repo)', (t) => {
+        t.skip('This repo is backend-only by design; these checks need the frontend repo as a sibling directory.');
+    });
+    return;
+}
+
 const read = (rel) => fs.readFileSync(path.join(SRC, rel), 'utf8');
 
 /**

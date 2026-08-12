@@ -19,7 +19,23 @@ const path = require('node:path');
 const ROOT = path.resolve(__dirname, '..', '..', '..');
 const FRONTEND = path.join(ROOT, 'frontend');
 
+/**
+ * This suite checks the FRONTEND's env handling (client bundle safety), which lives
+ * in the separate frontend/Appwrite repo since the Firebase backend was split out
+ * (BACKEND_MIGRATION_PROGRESS.md). It has no meaning run from this backend-only
+ * repo in isolation — skip cleanly rather than fail on a directory that is absent
+ * by design. Run from a checkout with both repos as siblings to get real coverage.
+ */
+const FRONTEND_AVAILABLE = fs.existsSync(FRONTEND);
+
 const read = (p) => fs.readFileSync(p, 'utf8');
+
+if (!FRONTEND_AVAILABLE) {
+    test('env safety checks (SKIPPED — frontend/ is not part of this standalone backend repo)', (t) => {
+        t.skip('This repo is backend-only by design; these checks need the frontend repo as a sibling directory.');
+    });
+    return;
+}
 
 // ---------------------------------------------------------------------------
 // Credentials must not be committed

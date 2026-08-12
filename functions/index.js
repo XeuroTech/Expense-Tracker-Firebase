@@ -21,21 +21,16 @@
  *     grant themselves Pro. It must not gain a Firebase equivalent. The client
  *     adapter rejects locally.
  *
- * `evaluateAutomations`
- *     NOT PORTED, and this is a decision rather than an omission. The Appwrite
- *     function lists active automations PROJECT-WIDE rather than scoping to the
- *     transaction's owner, and it has no recursion guard while the default rule shape
- *     can match its own output. Firestore makes both worse: triggers fire on Admin
- *     SDK writes too, so the blast radius would include split creation, settlement
- *     and AI smart-add — not just client writes.
- *
- *     Three things are required before any automation trigger ships: owner scoping by
- *     construction (the subcollection path gives this for free), a recursion guard
- *     (an `origin: 'automation'` marker the trigger ignores), and a depth ceiling.
- *     Until then automations are Appwrite-only — a capability gap that is stated here
- *     rather than discovered in production.
- *
- *     This is NOT permission to change the Appwrite function. It stays as it is.
+ * `evaluateAutomations` — NOW PORTED as `evaluateAutomationsOnTransactionCreate`.
+ *     Previously deferred: the Appwrite function lists active automations
+ *     PROJECT-WIDE rather than scoping to the transaction's owner, has no recursion
+ *     guard, and the default rule shape can match its own output. All three gaps
+ *     are closed in the Firestore version — see src/automations.js for exactly how:
+ *     owner scoping is structural (the trigger fires on `users/{uid}/transactions`,
+ *     never a collection-group query), a recursion guard (`origin: 'automation'`)
+ *     stops an automation-authored transaction from re-triggering, and an
+ *     independent depth ceiling backstops that guard. The Appwrite function is
+ *     unchanged and keeps running as-is.
  *
  * `createTransaction`, `updateTransaction`, `deleteTransaction`, `updateCategory`,
  * `deleteCategory`
@@ -46,10 +41,11 @@
  *     Replaced by the platform: `sendEmailVerification()` and
  *     `sendPasswordResetEmail()` / `confirmPasswordReset()`.
  *
- * `aiSmartAdd`
- *     Not yet ported. It needs the Groq API key, which is not available here, and it
- *     is the one remaining callable with no security or money implications — so it is
- *     the safest thing to defer. Recorded in BACKEND_MIGRATION_PROGRESS.md.
+ * `aiSmartAdd` — NOW PORTED.
+ *     See src/aiSmartAdd.js + src/aiSmartAddActions.js. Requires the `GROQ_API_KEY`
+ *     secret to be set (`firebase functions:secrets:set GROQ_API_KEY`) before the
+ *     parse path can actually call the model; auth, Pro-gating, rate limiting and
+ *     the confirm/cancel lifecycle all work without it.
  */
 
 const users = require('./src/users');
@@ -58,6 +54,8 @@ const splits = require('./src/splits');
 const notifications = require('./src/notifications');
 const account = require('./src/account');
 const billing = require('./src/billing');
+const automations = require('./src/automations');
+const aiSmartAdd = require('./src/aiSmartAdd');
 
 // --- identity ---------------------------------------------------------------
 exports.onUserCreated = users.onUserCreated;
@@ -94,3 +92,9 @@ exports.verifyGooglePurchase = billing.verifyGooglePurchase;
 exports.verifyApplePurchase = billing.verifyApplePurchase;
 exports.playRtdnHandler = billing.playRtdnHandler;
 exports.appleNotificationsV2Handler = billing.appleNotificationsV2Handler;
+
+// --- automation ---------------------------------------------------------------
+exports.evaluateAutomationsOnTransactionCreate = automations.evaluateAutomationsOnTransactionCreate;
+
+// --- AI smart add -------------------------------------------------------------
+exports.aiSmartAdd = aiSmartAdd.aiSmartAdd;

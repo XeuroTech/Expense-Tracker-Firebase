@@ -29,7 +29,19 @@ const indexes = JSON.parse(
     fs.readFileSync(path.join(FIREBASE_DIR, 'firestore.indexes.json'), 'utf8')
 ).indexes || [];
 
-const pathsSource = fs.readFileSync(path.join(SRC, 'backend', 'firebase', 'paths.ts'), 'utf8');
+/**
+ * "Every declared index is well formed" below needs only firestore.indexes.json,
+ * which lives in THIS repo. Everything else derives its expected index list from
+ * frontend adapter source, which lives in the separate frontend repo since the
+ * Firebase backend split (BACKEND_MIGRATION_PROGRESS.md) — skip those cleanly
+ * rather than fail on a directory absent by design. Run from a checkout with both
+ * repos as siblings to get full coverage.
+ */
+const FRONTEND_AVAILABLE = fs.existsSync(SRC);
+
+const pathsSource = FRONTEND_AVAILABLE
+    ? fs.readFileSync(path.join(SRC, 'backend', 'firebase', 'paths.ts'), 'utf8')
+    : '';
 
 /**
  * Parses SHARED_SCOPE_FIELD out of paths.ts rather than hard-coding it, so a change
@@ -58,7 +70,7 @@ const parseSharedScopeFields = () => {
     return map;
 };
 
-const SHARED_SCOPE = parseSharedScopeFields();
+const SHARED_SCOPE = FRONTEND_AVAILABLE ? parseSharedScopeFields() : {};
 
 /** A declared index covers a query if it contains every required field path. */
 const covers = (collectionGroup, fields) =>
@@ -80,7 +92,10 @@ const assertCovered = (collectionGroup, fields, why) => {
 // SHARED_SCOPE_FIELD is the contract these assertions rest on
 // ---------------------------------------------------------------------------
 
-test('SHARED_SCOPE_FIELD parses and covers the shared collections', () => {
+test('SHARED_SCOPE_FIELD parses and covers the shared collections', (t) => {
+    if (!FRONTEND_AVAILABLE) {
+        return t.skip('paths.ts lives in the separate frontend repo; run from a monorepo checkout to verify.');
+    }
     assert.strictEqual(SHARED_SCOPE.notifications, 'user_id');
     assert.strictEqual(SHARED_SCOPE.split_members, 'member_user_id');
 });
@@ -99,7 +114,10 @@ const SHARED_TABLES = [
 ];
 
 for (const table of SHARED_TABLES) {
-    test(`DataPort.list is indexed for ${table}`, () => {
+    test(`DataPort.list is indexed for ${table}`, (t) => {
+        if (!FRONTEND_AVAILABLE) {
+            return t.skip('paths.ts lives in the separate frontend repo; run from a monorepo checkout to verify.');
+        }
         const scopeField = SHARED_SCOPE[table] || 'participantIds';
         assertCovered(
             table,
@@ -115,7 +133,10 @@ for (const table of SHARED_TABLES) {
 // ---------------------------------------------------------------------------
 
 for (const table of SHARED_TABLES) {
-    test(`RealtimePort.watch is indexed for ${table}`, () => {
+    test(`RealtimePort.watch is indexed for ${table}`, (t) => {
+        if (!FRONTEND_AVAILABLE) {
+            return t.skip('paths.ts lives in the separate frontend repo; run from a monorepo checkout to verify.');
+        }
         const scopeField = SHARED_SCOPE[table] || 'participantIds';
         assertCovered(
             table,

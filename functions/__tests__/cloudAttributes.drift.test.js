@@ -31,6 +31,20 @@ const path = require('node:path');
 
 const ROOT = path.resolve(__dirname, '..', '..', '..');
 
+/**
+ * This drift guard compares FOUR files, two of which (syncService.ts, finance_sync)
+ * live only in the separate frontend/Appwrite repo since the Firebase backend split
+ * (BACKEND_MIGRATION_PROGRESS.md). It cannot run meaningfully from this backend-only
+ * repo in isolation — skip cleanly rather than fail on directories absent by design.
+ * Run from a checkout with both repos as siblings to get real drift coverage.
+ */
+if (!fs.existsSync(path.join(ROOT, 'frontend'))) {
+    test('cloud attribute drift checks (SKIPPED — frontend/backend siblings not present in this standalone repo)', (t) => {
+        t.skip('This repo is backend-only by design; these checks need the frontend + Appwrite repo as siblings.');
+    });
+    return;
+}
+
 const read = (relativePath) => fs.readFileSync(path.join(ROOT, relativePath), 'utf8');
 
 /** Extracts `const <NAME> ... = { ... };` — the first balanced block. */
