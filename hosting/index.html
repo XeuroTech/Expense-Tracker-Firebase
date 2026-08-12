@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Unity Finance</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #0b0f14;
+    color: #f5f7fa;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    padding: 24px;
+    box-sizing: border-box;
+  }
+  .card {
+    max-width: 420px;
+    width: 100%;
+    text-align: center;
+  }
+  .icon {
+    width: 64px;
+    height: 64px;
+    border-radius: 32px;
+    background: rgba(46, 204, 113, 0.15);
+    border: 1px solid rgba(46, 204, 113, 0.4);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin: 0 auto 20px;
+    font-size: 28px;
+  }
+  h1 { font-size: 22px; margin: 0 0 10px; }
+  p { color: #9aa4b2; font-size: 15px; line-height: 1.5; margin: 0 0 24px; }
+  a.button {
+    display: inline-block;
+    background: #ff6b6b;
+    color: #0b0f14;
+    font-weight: 700;
+    text-decoration: none;
+    padding: 14px 28px;
+    border-radius: 12px;
+    font-size: 15px;
+  }
+  .hint { margin-top: 18px; font-size: 13px; color: #6b7480; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon">✅</div>
+    <h1>All set</h1>
+    <p>This step is complete. Go back to the Unity Finance app to continue.</p>
+    <a class="button" id="openApp" href="unityfinance://">Open Unity Finance</a>
+    <p class="hint">If the app doesn't open automatically, switch back to it from your recent apps.</p>
+  </div>
+  <script>
+    // Best-effort auto-open - most mobile browsers block a bare location
+    // change to a custom scheme without a user gesture, so the button above
+    // is the reliable path. This just saves a tap when it's allowed.
+    try { window.location.replace('unityfinance://'); } catch (e) {}
+  </script>
+</body>
+</html>
