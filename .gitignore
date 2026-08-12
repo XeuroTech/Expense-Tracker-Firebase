@@ -1,0 +1,15 @@
+node_modules/
+npm-debug.log
+**/firestore-debug.log
+**/firebase-debug.log
+**/ui-debug.log
+**/database-debug.log
+**/pubsub-debug.log
+.firebase/
+*.log
+.DS_Store
+
+# Never commit: service account keys, credentials
+*serviceAccount*.json
+*service-account*.json
+.env.local

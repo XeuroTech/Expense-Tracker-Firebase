@@ -1,0 +1,343 @@
+rules_version = '2';
+
+// =============================================================================
+// Unity Finance — Firestore Security Rules (FIREBASE PROVIDER ONLY)
+//
+// The Appwrite authorization model — collection permissions `[]` plus API-key
+// functions (backend/lock_finance_permissions.js) — is untouched and keeps
+// serving the Appwrite provider. Nothing here affects it.
+//
+// WHAT REPLACES WHAT
+// ------------------
+// Appwrite concentrates ALL authorization inside `finance_sync`, in JS:
+//
+//     client -> function (API key) -> database
+//                    ^ authorization lives here
+//
+// Firestore splits that in two:
+//
+//     client -> RULES -> Firestore                (finance mirror: direct)
+//     client -> callable -> Firestore             (social/split/billing)
+//
+// These rules replace the FIRST set of checks only. The split and friend logic
+// stays in Cloud Functions because it is multi-document and multi-user, which
+// rules cannot express (see §9 of docs/phase-1/04).
+//
+// Guard-by-guard translation of finance_sync/src/main.js:
+//
+//   sanitized.user_id = userId        (:327)       -> path-derived ownership
+//   Query.equal('user_id', userId)    (:390-392)   -> path-derived scope
+//   table allowlist                   (:158-161)   -> isFinanceCollection()
+//   server-managed write refusal      (:301)       -> allow write: if false
+//   field allowlist (sanitizeDocument)             -> allowedFields() per collection
+//   current_balance create-only       (:33-35)     -> createOnlyUnchanged()
+//   requirePro                        (:143-155)   -> DELIBERATELY ABSENT — see below
+//
+// WHY THE PRO GATE IS NOT IN THESE RULES
+// --------------------------------------
+// It is the one guard that must NOT move here. There is no subscription renewal
+// webhook in the existing system (C-SUB-5), so every Pro subscriber is
+// auto-downgraded at first renewal. Under Appwrite that degrades gracefully:
+// sync stops, SQLite is still the source of truth, the app keeps working. A
+// rules-level write gate would turn the same event into a HARD WRITE LOCKOUT.
+// The gate therefore lives at the sync layer in the client adapter, exactly
+// where Appwrite puts it. See docs/phase-1/04 §7.
+// =============================================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------------------------------------------------------------------
+    // Helpers
+    // ---------------------------------------------------------------------
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function changed() {
+      return incoming().diff(existing()).affectedKeys();
+    }
+
+    // The ten user-owned mirror tables. This is the rules-layer equivalent of
+    // finance_sync's `CLOUD_ATTRIBUTES[table]` allowlist check (main.js:158-161)
+    // and stops a client creating `users/{uid}/arbitrary_junk`.
+    function isFinanceCollection(c) {
+      return c in [
+        'wallets', 'payees', 'categories', 'transactions', 'recurring_plans',
+        'budgets', 'budget_periods', 'recurring_installments',
+        'automations', 'device_tokens'
+      ];
+    }
+
+    // Server-stamped metadata. Mirrors frontend/src/backend/firebase/serialize.ts.
+    //
+    // NOTE the underscore prefix. docs/phase-1/03 §3 originally specified
+    // `created_at`/`updated_at`/`deleted_at`, but SIX tables already declare
+    // `created_at`/`updated_at` as DOMAIN STRING fields in CLOUD_ATTRIBUTES
+    // (friend_requests, friends, split_expenses, split_members, notifications,
+    // device_tokens). Reusing those names would have silently overwritten domain
+    // data with Timestamps. Firestore only reserves DOUBLE-underscore names, so a
+    // single leading underscore is legal and cannot collide.
+    function metadataFields() {
+      return ['user_id', '_createdAt', '_updatedAt', '_deletedAt'];
+    }
+
+    // Verbatim from syncService.ts:39-201 / finance_sync/src/main.js:14-31.
+    // Any drift makes a legitimate client write fail, so these must be kept in
+    // step with frontend/src/backend/firebase/cloudAttributes.ts.
+    function allowedFields(c) {
+      return c == 'wallets'
+          ? ['name', 'type', 'current_balance', 'credit_limit', 'due_date',
+             'color_hex', 'icon_id', 'currency']
+        : c == 'payees'
+          ? ['name', 'is_business', 'loan_balance', 'invested_amount',
+             'total_profits', 'logo_id']
+        : c == 'categories'
+          ? ['name', 'type', 'color', 'icon', 'parent_id']
+        : c == 'recurring_plans'
+          ? ['name', 'amount', 'type', 'category', 'interval', 'start_date',
+             'payee_id', 'total_paid']
+        : c == 'transactions'
+          ? ['amount', 'type', 'wallet_id', 'payee_id', 'category_id',
+             'recurring_plan_id', 'date', 'note', 'source', 'splitExpenseId',
+             'splitMemberId']
+        : c == 'budgets'
+          ? ['name', 'category_id', 'allocated_amount', 'spent_amount', 'period',
+             'start_date', 'carry_forward']
+        : c == 'budget_periods'
+          ? ['budget_id', 'period_start', 'period_end', 'allocated_amount',
+             'carry_forward_amount', 'spent_amount', 'status']
+        : c == 'recurring_installments'
+          ? ['plan_id', 'due_date', 'period_start', 'period_end', 'amount_due',
+             'amount_paid', 'status']
+        : c == 'automations'
+          ? ['name', 'is_active', 'trigger_type', 'conditions', 'action_type',
+             'action_payload']
+        : c == 'device_tokens'
+          ? ['token', 'platform', 'device_id', 'is_active', 'created_at',
+             'updated_at', 'last_seen_at', 'token_kind']
+        : [];
+    }
+
+    // finance_sync's CLOUD_CREATE_ONLY_ATTRIBUTES (main.js:33-35).
+    // The wallet balance is authoritative in SQLite and recomputed from
+    // transactions; letting a stale client copy overwrite the mirror on every
+    // sync would make the mirror drift from the ledger.
+    function createOnlyFields(c) {
+      return c == 'wallets' ? ['current_balance'] : [];
+    }
+
+    // Entitlement keys inside `users/{uid}.prefs`. Server-write-only.
+    // Mirrors SubscriptionPrefs (services/subscription.ts:24-34).
+    function subscriptionKeys() {
+      return ['plan', 'subscriptionStatus', 'subscriptionExpiresAt',
+              'subscriptionEndDate', 'subscriptionStartDate',
+              'subscriptionPlatform', 'subscriptionProductId',
+              'subscriptionVerificationHash', 'billingCycle'];
+    }
+
+    function hasOnlyAllowedFields(c) {
+      return incoming().keys().hasOnly(allowedFields(c).concat(metadataFields()));
+    }
+
+    function validCreate(uid, c) {
+      return hasOnlyAllowedFields(c)
+        && incoming().user_id == uid          // == sanitized.user_id = userId
+        && incoming()._createdAt == request.time
+        && incoming()._updatedAt == request.time
+        && incoming()._deletedAt == null;     // explicit null, NOT absent — see below
+    }
+
+    function validUpdate(uid, c) {
+      return hasOnlyAllowedFields(c)
+        && incoming().user_id == uid
+        && incoming().user_id == existing().user_id       // owner is immutable
+        && incoming()._createdAt == existing()._createdAt // creation time is immutable
+        && incoming()._updatedAt == request.time
+        && !changed().hasAny(createOnlyFields(c));
+    }
+
+    // ---------------------------------------------------------------------
+    // users/{uid} — the profile document and the entitlement blob
+    // ---------------------------------------------------------------------
+    match /users/{uid} {
+      allow read: if isOwner(uid);
+
+      // `prefs` is the Firebase replacement for Appwrite's HMAC-signed
+      // subscription preferences (C-SUB-1). Appwrite MUST sign the blob because
+      // it lives in client-writable account prefs. Here the subscription keys are
+      // simply not writable by the client, so there is no signature to forge and
+      // no shared secret in the app bundle. Same guarantee, enforced structurally.
+      //
+      // Everything else in `prefs` stays client-writable, so ordinary settings
+      // (theme, notification toggles, onboarding flags) keep working exactly as
+      // they do on Appwrite.
+      //
+      // The check is a DIFF, not a key presence test. A presence test would
+      // reject every prefs update once a subscription existed, because
+      // `request.resource.data` on a merge write is the FULL merged document and
+      // therefore always contains the subscription keys.
+      allow create: if isOwner(uid)
+        && !incoming().get('prefs', {}).keys().hasAny(subscriptionKeys());
+
+      allow update: if isOwner(uid)
+        && !incoming().get('prefs', {})
+              .diff(existing().get('prefs', {}))
+              .affectedKeys()
+              .hasAny(subscriptionKeys());
+
+      allow delete: if false;   // account deletion is a callable (Admin SDK)
+
+      // -------------------------------------------------------------------
+      // The ten finance mirror subcollections.
+      //
+      // THIS IS THE SINGLE LARGEST SECURITY GAIN OF THE FORK: the owner comes
+      // from the PATH, so no client field and no query predicate can widen it.
+      // The existing `evaluate_automations` cross-tenant defect — it lists
+      // active automations project-wide and can therefore mutate another user's
+      // wallets and budgets — is not merely blocked here, it is UNWRITEABLE.
+      // -------------------------------------------------------------------
+      match /{collection}/{docId} {
+        allow read: if isOwner(uid) && isFinanceCollection(collection);
+
+        allow create: if isOwner(uid)
+          && isFinanceCollection(collection)
+          && validCreate(uid, collection);
+
+        allow update: if isOwner(uid)
+          && isFinanceCollection(collection)
+          && validUpdate(uid, collection);
+
+        // Deletion is a TOMBSTONE (`_deletedAt`), applied as an update. Hard
+        // delete is refused outright so that no client bug or compromised token
+        // can irrecoverably destroy financial history. Account deletion runs
+        // through a callable on the Admin SDK, which bypasses rules.
+        allow delete: if false;
+      }
+    }
+
+    // ---------------------------------------------------------------------
+    // Shared, server-managed collections.
+    //
+    // `allow write: if false` is the exact Firestore expression of Appwrite's
+    // `isServerManagedWrite` refusal (finance_sync/src/main.js:69-77, :301).
+    // Cloud Functions use the Admin SDK, which bypasses rules entirely — that is
+    // the intended and only write path.
+    //
+    // Firestore has no per-document ACLs, so co-ownership is denormalised into
+    // `participantIds`. Client queries MUST carry the matching predicate or the
+    // whole query fails — rules are not filters.
+    // ---------------------------------------------------------------------
+
+    function isParticipant() {
+      return isSignedIn() && request.auth.uid in existing().participantIds;
+    }
+
+    match /friends/{id} {
+      allow read: if isParticipant();
+      allow write: if false;
+    }
+
+    match /friend_requests/{id} {
+      allow read: if isParticipant();
+      allow write: if false;
+    }
+
+    match /split_expenses/{id} {
+      allow read: if isParticipant();
+      allow write: if false;
+    }
+
+    match /split_members/{id} {
+      // Two accepted shapes because the client queries by `member_user_id`
+      // (one row per member) while co-ownership is expressed by
+      // `participantIds`. Both must be permitted or the client's own query —
+      // `where('member_user_id','==',uid)` — would be denied in full.
+      allow read: if isSignedIn()
+        && (request.auth.uid == existing().member_user_id || isParticipant());
+      allow write: if false;
+    }
+
+    // The settlement/creation mutex. NO client path at all, in either direction.
+    // Its whole purpose is that only the server may create it, and only with
+    // create() semantics — set() would overwrite it silently and let two
+    // concurrent settlements both move money (C-SP-4).
+    match /split_operations/{id} {
+      allow read, write: if false;
+    }
+
+    // ---------------------------------------------------------------------
+    // notifications — the one partial-write case
+    // ---------------------------------------------------------------------
+    match /notifications/{id} {
+      allow read: if isSignedIn() && request.auth.uid == existing().user_id;
+
+      allow create: if false;   // trigger/callable only
+
+      // Preserves `markNotificationRead` (notificationService.ts:85-97), which
+      // writes exactly these two fields and nothing else.
+      allow update: if isSignedIn()
+        && request.auth.uid == existing().user_id
+        && changed().hasOnly(['is_read', 'read_at']);
+
+      // Delete stays callable-only: the contract includes a 100-item bulk cap
+      // (TOO_MANY_NOTIFICATIONS) and idempotent not-found handling (C-NT-4),
+      // neither of which rules can express.
+      allow delete: if false;
+    }
+
+    // ---------------------------------------------------------------------
+    // public_profiles — a NEW privacy surface, deliberately kept closed
+    //
+    // This collection exists only because Firebase Auth has no user-search API.
+    // It is the one place where the fork could ACCIDENTALLY create an exposure
+    // Appwrite does not have: `allow read: if isSignedIn()` would let any
+    // authenticated user enumerate the entire user base, including every email
+    // address. Appwrite's search runs server-side inside `search_app_user` with
+    // an API key and returns curated fields.
+    //
+    // So: no client read at all. The `searchUsers` callable does the lookup with
+    // the Admin SDK, which reproduces the existing privacy posture exactly
+    // rather than widening it.
+    // ---------------------------------------------------------------------
+    match /public_profiles/{uid} {
+      allow read, write: if false;
+    }
+
+    // Server-only. `otp_challenges` backs the email-change flow; document
+    // existence in `purchase_tokens` IS the "already claimed" check.
+    match /otp_challenges/{id} {
+      allow read, write: if false;
+    }
+
+    match /purchase_tokens/{id} {
+      allow read, write: if false;
+    }
+
+    // Server-only. Backs `assertRateLimit` (brief §16) — a client that could write
+    // its own counter could simply reset it before the next call.
+    match /rate_limits/{id} {
+      allow read, write: if false;
+    }
+
+    // ---------------------------------------------------------------------
+    // Default deny. Anything not matched above is unreachable.
+    // ---------------------------------------------------------------------
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

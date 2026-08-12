@@ -1,0 +1,42 @@
+{
+  "//": [
+    "Firebase project configuration for the FIREBASE PROVIDER.",
+    "",
+    "This directory is parallel to `backend/`, which holds the Appwrite project",
+    "(appwrite.json, schema.js and 23 functions). Neither knows about the other and",
+    "neither is affected by changes to the other.",
+    "",
+    "DEC-REGION IS STILL OPEN. Firestore's location is IMMUTABLE once set and Cloud",
+    "Functions should be co-located. It cannot be revised without recreating the",
+    "project and moving all data, so it must be answered before the first deploy.",
+    "Set `EXPO_PUBLIC_FIREBASE_REGION` (client) and `FIREBASE_REGION` (functions)",
+    "to match whatever is chosen."
+  ],
+
+  "firestore": {
+    "rules": "firestore.rules",
+    "indexes": "firestore.indexes.json"
+  },
+
+  "storage": {
+    "rules": "storage.rules"
+  },
+
+  "functions": [
+    {
+      "source": "functions",
+      "codebase": "default",
+      "runtime": "nodejs20",
+      "ignore": ["node_modules", ".git", "**/*.local", "**/__tests__/**"]
+    }
+  ],
+
+  "emulators": {
+    "auth": { "port": 9099 },
+    "firestore": { "port": 8080 },
+    "functions": { "port": 5001 },
+    "storage": { "port": 9199 },
+    "ui": { "enabled": true, "port": 4000 },
+    "singleProjectMode": true
+  }
+}

@@ -1,0 +1,528 @@
+{
+  "//": [
+    "Composite indexes for the Firebase provider.",
+    "",
+    "RULE: every query the app issues must have a declared index BEFORE the",
+    "provider ships. Firestore FAILS a query with a missing index rather than",
+    "degrading — and a failed pull returns an empty document list, after which",
+    "localDb.removeSyncedMissingFromCloud hard-deletes every local row the pull",
+    "did not return. A missing index is therefore a DATA LOSS path, not a",
+    "performance problem.",
+    "",
+    "Only the queries the provider actually issues are listed. The owner-scoped",
+    "finance subcollections need NO composite index: the owner is in the path, so",
+    "their queries are a single equality (`_deletedAt == null`) or a single",
+    "inequality (`_updatedAt > floor`), both served by Firestore's automatic",
+    "single-field indexes.",
+    "",
+    "Query sources:",
+    "  PULL      dataAdapter.list  -> scope + _deletedAt == null, orderBy(__name__)",
+    "  COUNT     dataAdapter.list  -> same filters via getCountFromServer",
+    "  REALTIME  realtimeAdapter   -> scope + _updatedAt > sessionFloor",
+    "  INBOX     notificationAdapter.list -> user_id + _deletedAt, orderBy(created_at desc)",
+    "",
+    "NOT LISTED: searchUsers' prefix match on public_profiles.name_lower. A composite",
+    "[name_lower ASC, __name__ ASC] entry was tried and REJECTED by live deploy with",
+    "'this index is not necessary, configure using single field index controls' —",
+    "Firestore already appends __name__ as the implicit tiebreaker on the automatic",
+    "single-field index, so the composite was a pure duplicate."
+  ],
+  "indexes": [
+    {
+      "//": "PULL + COUNT — friends",
+      "collectionGroup": "friends",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "participantIds",
+          "arrayConfig": "CONTAINS"
+        },
+        {
+          "fieldPath": "_deletedAt",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "__name__",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
+      "//": "REALTIME — friends",
+      "collectionGroup": "friends",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "participantIds",
+          "arrayConfig": "CONTAINS"
+        },
+        {
+          "fieldPath": "_updatedAt",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
+      "//": "PULL + COUNT — friend_requests",
+      "collectionGroup": "friend_requests",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "participantIds",
+          "arrayConfig": "CONTAINS"
+        },
+        {
+          "fieldPath": "_deletedAt",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "__name__",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
+      "//": "REALTIME — friend_requests",
+      "collectionGroup": "friend_requests",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "participantIds",
+          "arrayConfig": "CONTAINS"
+        },
+        {
+          "fieldPath": "_updatedAt",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
+      "//": "Cross-direction uniqueness lookup used by sendFriendRequest",
+      "collectionGroup": "friend_requests",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "pair_key",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "status",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
+      "//": "PULL + COUNT — split_expenses",
+      "collectionGroup": "split_expenses",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "participantIds",
+          "arrayConfig": "CONTAINS"
+        },
+        {
+          "fieldPath": "_deletedAt",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "__name__",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
+      "//": "REALTIME — split_expenses",
+      "collectionGroup": "split_expenses",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "participantIds",
+          "arrayConfig": "CONTAINS"
+        },
+        {
+          "fieldPath": "_updatedAt",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
+      "//": "request_id idempotency lookup (C-SP-3) — createSplitExpense",
+      "collectionGroup": "split_expenses",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "request_id",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "created_by_user_id",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
+      "//": "PULL + COUNT — split_members",
+      "collectionGroup": "split_members",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "member_user_id",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "_deletedAt",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "__name__",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
+      "//": "REALTIME — split_members",
+      "collectionGroup": "split_members",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "member_user_id",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "_updatedAt",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
+      "//": "Members of one split — used by every split callable",
+      "collectionGroup": "split_members",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "split_expense_id",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "_deletedAt",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
+      "//": "Settlement listing — mirrors idx_split_members_user_status",
+      "collectionGroup": "split_members",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "member_user_id",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "settlement_status",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "_updatedAt",
+          "order": "DESCENDING"
+        }
+      ]
+    },
+    {
+      "//": "PULL + COUNT — notifications",
+      "collectionGroup": "notifications",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "user_id",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "_deletedAt",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "__name__",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
+      "//": "INBOX — notificationAdapter.list, mirrors idx_notifications_user_read_created",
+      "collectionGroup": "notifications",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "user_id",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "_deletedAt",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "created_at",
+          "order": "DESCENDING"
+        }
+      ]
+    },
+    {
+      "//": "REALTIME — notifications",
+      "collectionGroup": "notifications",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "user_id",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "_updatedAt",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
+      "//": "listFriends callable",
+      "collectionGroup": "friends",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "user_id",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "status",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "_deletedAt",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
+      "//": "assertMutualFriends — forward direction",
+      "collectionGroup": "friends",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "user_id",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "friend_user_id",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "status",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "_deletedAt",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
+      "//": "assertMutualFriends — reverse direction (a one-sided row is NOT mutual)",
+      "collectionGroup": "friends",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "friend_user_id",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "user_id",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "status",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "_deletedAt",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
+      "//": "refreshFriendAvatar fan-out",
+      "collectionGroup": "friends",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "friend_user_id",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "_deletedAt",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
+      "//": "resolveRelationships — search result annotation",
+      "collectionGroup": "friends",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "pair_key",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "participantIds",
+          "arrayConfig": "CONTAINS"
+        }
+      ]
+    },
+    {
+      "//": "listFriendRequests callable",
+      "collectionGroup": "friend_requests",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "participantIds",
+          "arrayConfig": "CONTAINS"
+        },
+        {
+          "fieldPath": "status",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "_deletedAt",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
+      "//": "listSplitRequests — creator side",
+      "collectionGroup": "split_expenses",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "created_by_user_id",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "_deletedAt",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "_updatedAt",
+          "order": "DESCENDING"
+        }
+      ]
+    },
+    {
+      "//": "listSplitRequests — member side",
+      "collectionGroup": "split_members",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "member_user_id",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "_deletedAt",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "_updatedAt",
+          "order": "DESCENDING"
+        }
+      ]
+    },
+    {
+      "//": "onNotificationCreated — active FCM tokens for a recipient",
+      "collectionGroup": "device_tokens",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "is_active",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "_deletedAt",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
+      "//": "deleteAccount — shared-row cleanup by owner",
+      "collectionGroup": "split_members",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "user_id",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "_deletedAt",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "split_expenses",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "created_by_user_id",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "request_id",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "participantIds",
+          "arrayConfig": "CONTAINS"
+        },
+        {
+          "fieldPath": "_deletedAt",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "__name__",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "split_members",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "split_expense_id",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "member_user_id",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "_deletedAt",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "__name__",
+          "order": "ASCENDING"
+        }
+      ]
+    }
+  ],
+  "fieldOverrides": [
+    {
+      "//": [
+        "device_tokens is written by a callable keyed on sha256(token) and is only",
+        "ever read by the push dispatcher, never queried by the client. Exempting",
+        "it from automatic single-field indexing removes an index write per token",
+        "field on every registration and refresh."
+      ],
+      "collectionGroup": "device_tokens",
+      "fieldPath": "token",
+      "indexes": []
+    }
+  ]
+}

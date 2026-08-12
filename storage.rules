@@ -1,0 +1,63 @@
+rules_version = '2';
+
+// =============================================================================
+// Unity Finance — Firebase Storage Rules (FIREBASE PROVIDER ONLY)
+//
+// Appwrite Storage and its `logos` bucket are untouched.
+//
+// PATH SHAPE
+// ----------
+// Appwrite has ONE flat bucket (`logos`) holding both payee logos and profile
+// images (C-ST-1). The Firebase path gains a `{uid}` segment:
+//
+//     logos/{uid}/{fileId}
+//
+// That segment is not cosmetic — it is the only thing that makes a per-user
+// WRITE rule expressible at all. A flat namespace cannot distinguish "my logo"
+// from "someone else's".
+//
+// THE READ RULE, AND WHY IT IS PUBLIC
+// -----------------------------------
+// `StoragePort.getPreviewUrl` is SYNCHRONOUS by contract (C-ST-2) and is called
+// inline during render. Firebase's `getDownloadURL()` is async, so the adapter
+// constructs the URL instead:
+//
+//     https://firebasestorage.googleapis.com/v0/b/{bucket}/o/{path}?alt=media
+//
+// An <Image> tag fetching that URL sends NO Firebase credentials — it is a plain
+// GET. So a constructed URL only renders if the object is publicly readable.
+//
+// This matches what the app already relies on: Appwrite's `getFilePreview`
+// likewise returns a plain URL that <Image> fetches unauthenticated. These
+// assets are already "readable by whoever holds the URL", and the path still
+// contains a uid plus a 20-hex file id, so they are not enumerable.
+//
+// It is a real property of the system and should be a decision rather than an
+// inheritance. Tightening it to authenticated-read requires making
+// `getPreviewUrl` async, which changes every render site that shows an avatar or
+// a payee logo — tracked as DEC-STORAGE-URL.
+//
+// WRITES ARE NOT PUBLIC. They are owner-scoped, size-capped and type-checked.
+// =============================================================================
+
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    match /logos/{uid}/{fileId} {
+      // See the header. Deliberate, not an oversight.
+      allow read: if true;
+
+      allow write: if request.auth != null
+                   && request.auth.uid == uid
+                   && request.resource.size < 5 * 1024 * 1024
+                   && request.resource.contentType.matches('image/.*');
+
+      allow delete: if request.auth != null && request.auth.uid == uid;
+    }
+
+    // Default deny — no other path in the bucket is reachable.
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
