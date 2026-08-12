@@ -10,11 +10,20 @@ Persistent cross-session tracker for the **Appwrite + Firebase dual-backend fork
 
 ## CURRENT PHASE
 
-**Phase 3+ — Live Firebase Deployment, Verification & Repository Separation.**
-Status: **Firestore rules + 27/27 indexes are LIVE and READY on `expense-tracker-b8db9`
-(`me-central1` — see correction below, this differs from what was first reported).
-Storage rules and Cloud Functions deploy are BLOCKED on a real GCP IAM permission gap
-that needs the project Owner, not a code defect.**
+**Phase 4 — Appwrite Parity Completion. COMPLETE.**
+All 29 actively-used Appwrite operations (audited by tracing real frontend code, not
+by counting Appwrite Functions) now have a Firebase equivalent — either EXACT parity,
+an intentional architectural difference already documented, or a newly-built port.
+The two genuine gaps this phase closed: `aiSmartAdd` (Firebase callable, full parse
+→ confirm → cancel lifecycle, real Groq integration) and `evaluateAutomationsOnTransactionCreate`
+(Firestore trigger, the previously-deferred automation engine, now safe to ship).
+Both are deployed to `expense-tracker-b8db9` (`me-central1`) and live-verified with
+real auth users, a real Groq call, and real money movement. See "PHASE 4" below for
+the full parity matrix and verification detail. 26/26 Cloud Functions ACTIVE.
+
+**Phase 3 — Live Firebase Deployment, Verification & Repository Separation. COMPLETE.**
+Status: Firestore rules + 27/27 indexes LIVE and READY on `expense-tracker-b8db9`
+(`me-central1`). Storage rules and all Cloud Functions deployed and verified.
 
 **⚠️ REGION CORRECTION, same session:** the live database was reported as
 `us-central1` and I deployed functions code assuming that. A direct
@@ -810,4 +819,149 @@ Do not assume something is implemented because this file says so.
 
 ---
 
-_Last updated: 2026-08-11 — end of Phase 3 implementation session._
+## PHASE 4 — APPWRITE PARITY COMPLETION (2026-08-12)
+
+### Source of truth used
+
+Not "how many Appwrite Functions exist" (23, several dead). Traced the ACTUAL
+frontend code path for every finance/social/AI operation the app performs, then
+compared against what the Firebase provider does for the same operation.
+
+### Parity matrix — final
+
+| # | Active operation | Firebase equivalent | Status |
+|---|---|---|---|
+| 1–7 | Transaction CRUD, filter, category/wallet relations, calculations | `dataAdapter.ts` direct Firestore + `firestore.rules` (`users/{uid}/transactions`) | INTENTIONAL ARCHITECTURAL DIFFERENCE — `financeSync` has no Cloud Function equivalent by design; enforcement moved to rules |
+| 8–12 | Wallet CRUD, balance | Same generic mirror; balance is client-computed (SQLite), identical on both providers | INTENTIONAL ARCHITECTURAL DIFFERENCE |
+| 13–16 | Category CRUD | Same generic mirror. Appwrite's dedicated `update_category`/`delete_category` (cascade-delete children, block-if-in-use) are DEAD — zero frontend callers, confirmed via `useCategories.ts` | EXACT (active path) / N/A (dead Appwrite code, not reproduced) |
+| 17–21 | Budget CRUD, progress | Same generic mirror; progress computed client-side | INTENTIONAL ARCHITECTURAL DIFFERENCE |
+| 22 | Recurring plan CRUD | Same generic mirror (`useRecurring.ts` is pure `dbService`, provider-agnostic) | EXACT |
+| 23 | Scheduled recurring transaction processing | Client-driven (`useRecurring.ts` computes due occurrences, syncs as normal transactions) — no server component on EITHER provider | INTENTIONAL ARCHITECTURAL DIFFERENCE |
+| 24 | Automation/evaluation logic | **`evaluateAutomationsOnTransactionCreate`** — NEW. Firestore trigger on `users/{uid}/transactions`. Closes the 3 gaps that got the Appwrite version's port deferred: owner-scoped by construction, `origin:'automation'` recursion guard, independent depth ceiling | **BUILT, DEPLOYED, LIVE-VERIFIED** |
+| 25 | User search | `searchUsers` callable | EXACT (already done pre-Phase-4) |
+| 26 | Friend request creation | `sendFriendRequest` | EXACT |
+| 27 | Friend request response | `respondFriendRequest` | EXACT |
+| 28 | Friends list / management | `listFriends`, `listFriendRequests`, `removeFriend`, `refreshFriendAvatar` | EXACT |
+| 29 | Splits, settlement, notifications, device tokens, account/auth, billing, **AI Smart Add**, analytics, sync | `createSplitExpense`/`respondSplitRequest`/`settleSplitPayment`/`onNotificationCreated`/`notificationActions`/`registerDeviceToken`/`deleteAccount`/`requestEmailChange`/`confirmEmailChange`/`verifyGooglePurchase`/`verifyApplePurchase`/`playRtdnHandler`/`appleNotificationsV2Handler` (all pre-existing) + **`aiSmartAdd`** (NEW) | EXACT / **BUILT, DEPLOYED, LIVE-VERIFIED** |
+
+Also confirmed, not reproduced (matches `functions/index.js`'s own header, verified
+independently this session):
+- `create_transaction`/`update_transaction`/`delete_transaction` — dead, zero frontend callers (`useTransactions.ts` is pure `dbService`).
+- `reset-password`/`verify_email` — superseded by native `sendPasswordResetEmail`/`sendEmailVerification`, already implemented.
+- `test_pro_upgrade` — deliberately NOT ported (security decision, already implemented as a hard local rejection).
+- `finance_sync` — deliberately NOT ported (direct Firestore + rules, already implemented).
+
+**MISSING = 0. PARTIAL = 0.**
+
+### What was built
+
+- **`functions/src/aiSmartAdd.js` / `aiSmartAddActions.js` / `aiSmartAddConstants.js`** —
+  full port of `backend/functions/ai_smart_add` (constants + validation + actions +
+  main, ~1600 lines of Appwrite source): parse (Groq call) → confirm → cancel,
+  every intent (transaction/recurring_plan/budget/wallet_create/category_create/
+  payee_create/loan_create/investment_create), wallet/category/payee resolution by
+  ID and by name, provisional-category cleanup, duplicate-prompt detection,
+  Pro-gating via the existing `requirePro`, rate limiting via the existing
+  `assertRateLimit` (8/60s, same budget as Appwrite), Firestore-transaction money
+  effects using the same `applyBalanceDelta` cents-safe arithmetic as `splits.js`.
+  `GROQ_API_KEY` is a bound Secret Manager secret (`defineSecret`), not a plain env
+  var — set via `firebase functions:secrets:set GROQ_API_KEY`.
+
+- **`functions/src/automations.js`** — full port of `backend/functions/evaluate_automations`
+  as a Firestore trigger, with the three safety fixes the original deferral called
+  for: owner scoping by construction (trigger path is `users/{uid}/transactions`,
+  never a collection-group query), a recursion guard (`origin:'automation'` marker),
+  and an independent depth ceiling (`automationDepth`, `MAX_AUTOMATION_DEPTH = 1`).
+  `create_transfer` and `allocate_budget` actions both ported behaviourally verbatim,
+  including the Appwrite version's lack of an insufficient-balance guard (preserved,
+  not "fixed" — see the file header for why).
+
+- **No new Firestore composite indexes.** Every new query is single-field-filtered
+  (matching Firestore's automatic indexing) with any additional matching done in
+  memory over a bounded `limit()`, mirroring the exact pattern the Appwrite source
+  already uses (`listUserDocs`, `findOwnedByName`) and avoiding new index-build risk.
+
+- **Fixed a pre-existing defect in this repo**: 5 test files (`envSafety`,
+  `cloudAttributes.drift`, `errorParity`, `indexCoverage`, `providerIsolation`)
+  assumed the pre-split monorepo layout (`frontend/` as a sibling directory) and
+  crashed with `ENOENT` when run from this backend-only repo — a gap from the
+  Phase 3 repository-separation step, not from this session's own changes (verified:
+  same 32 pass / 31 fail on the commit BEFORE this session's changes). They now skip
+  cleanly with an explanatory reason instead of failing on a directory that is
+  absent by design.
+
+### Tests
+
+- `npm test` (no emulator): **93/93** — 58 pass, 35 skip (33 are the cross-repo
+  drift checks above, needing the frontend repo as a sibling; 2 are the pre-existing
+  rate-limit functional tests), 0 fail.
+- `npm run test:all` (Firestore emulator, JDK via `E:/Android/AndroidSdk/jbr`):
+  **107/107** — 92 pass, 15 skip (same cross-repo checks), 0 fail. Includes new
+  functional coverage: `create_transfer` money movement, `allocate_budget`,
+  non-matching conditions correctly no-op, the recursion guard and depth ceiling
+  both independently verified to stop re-evaluation, `confirmPending` for
+  transaction/wallet_create/budget intents, insufficient-balance rejection leaves
+  the wallet untouched, double-confirm rejection, TTL expiry, and `cancelPending`'s
+  provisional-category cleanup.
+
+### Live verification (real project, real auth users, no device)
+
+15/15 checks passed against `expense-tracker-b8db9`:
+- `aiSmartAdd` rejects unauthenticated calls (401) and correctly enforces the Pro
+  gate for a free user (403 `PRO_PLAN_REQUIRED`) before any Groq call is placed.
+- A REAL Groq API call (model `llama-3.3-70b-versatile`) correctly parsed
+  "I spent 25 dollars on food from Verify Wallet" into `intent=transaction,
+  transactionType=expense, amount=25`, resolved the wallet/category by NAME against
+  the seeded documents, and stored a pending action with a 30-minute TTL.
+- `confirm` created the real transaction and debited the real wallet (500 → 475).
+- `evaluateAutomationsOnTransactionCreate` fired on a real transaction create (not
+  via `aiSmartAdd` — the plain client-write path) and moved real money: a
+  `create_transfer` automation with `{{amount * 0.10}}` on a 200-unit transaction
+  moved exactly 20 from a source wallet (1000 → 980) to a destination wallet
+  (0 → 20).
+- The recursion guard held live: exactly one automation-authored transaction
+  existed afterward (`origin:'automation'`), not a runaway chain.
+
+One real bug found and fixed during this verification: the deployed `GROQ_API_KEY`
+secret's first value did not match what was intended (Groq returned a clean `401
+Invalid API Key`, not a network failure) — caught only because `callGroq`'s error
+handling was improved mid-session to log the underlying HTTP status and response
+body server-side instead of collapsing every failure into one generic message.
+Re-set correctly, redeployed, re-verified — all 15/15 checks then passed.
+
+### Known issues carried forward (unchanged by this session)
+
+- Store receipt validation (Play/App Store credentials), Apple JWS verification for
+  `appleNotificationsV2Handler`, App Check, DEC-EMAIL-PROVIDER, §43 structured
+  logging on the remaining ~19 non-money-path functions, Firestore TTL policy on
+  `rate_limits.expires_at` — all pre-existing, all still deferred for the same
+  reasons already recorded above.
+- `aiSmartAdd` and `evaluateAutomationsOnTransactionCreate` are backend-complete
+  and live-verified, but the frontend does not call either yet: `smartAddService.ts`
+  is hardcoded to the Appwrite SDK (bypasses the provider-abstraction ports
+  entirely, on BOTH providers today), and no screen creates an `automations`
+  document on either provider. Wiring the frontend to actually use these is a
+  separate, frontend-touching decision explicitly out of scope for this session.
+
+### Repository / cleanup
+
+- Committed as `dbbcbeb` (the port) and `6154a13` (the Groq error-logging fix),
+  merged to `main`, pushed to `https://github.com/XeuroTech/Expense-Tracker-Firebase`
+  — verified via the GitHub API that both new commits and all 4 new files
+  (`aiSmartAdd.js`, `aiSmartAddActions.js`, `aiSmartAddConstants.js`,
+  `automations.js`) are present on `main`.
+- The old monorepo (`expense tracker/expense-tracker`) was only ever READ from
+  during this session's audit — `git status`/`git diff` there both confirm zero
+  changes. Appwrite, the frontend, SQLite, Google Drive backup, Analytics and
+  Crashlytics are all untouched.
+
+### NEXT EXACT TASK
+
+Nothing outstanding from backend parity. Remaining items are either credential/
+hardware-gated (App Check, store receipts, physical-device push/realtime) or a
+frontend-side decision (wiring `aiSmartAdd`/`automations` UI, switching the app's
+active provider) that was explicitly not part of this session's scope.
+
+---
+
+_Last updated: 2026-08-12 — end of Phase 4 (Appwrite parity completion) session._
