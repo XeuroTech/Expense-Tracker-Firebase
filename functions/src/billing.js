@@ -39,6 +39,15 @@ const REGION = process.env.FIREBASE_REGION || 'me-central1';
 
 /**
  * Writes the entitlement. The ONLY place `prefs.plan` is ever set to 'pro'.
+ *
+ * `subscriptionVerificationHash` MUST be a non-empty string here. The shared
+ * frontend gate (`services/subscription.ts` -> `normalizeSubscriptionPrefs` ->
+ * `hasServerVerification`) treats `plan: 'pro'` alone as NOT verified and falls
+ * back to Free unless this field is also present - it is the Firebase port of
+ * Appwrite's HMAC-signed prefs blob (there is no signature to verify here,
+ * since these keys are server-write-only per firestore.rules, but the client
+ * check still requires the field to exist). Omitting it - the bug this fixes -
+ * meant NO grant, real purchase or otherwise, ever showed as Pro on the client.
  */
 const grantEntitlement = async (uid, { productId, platform, expiresAt, billingCycle, status }) => {
     await db.collection('users').doc(uid).set(
@@ -51,6 +60,7 @@ const grantEntitlement = async (uid, { productId, platform, expiresAt, billingCy
                 subscriptionExpiresAt: expiresAt,
                 subscriptionEndDate: expiresAt,
                 billingCycle: billingCycle || null,
+                subscriptionVerificationHash: sha256(`${uid}:${productId}:${status}:${expiresAt}`),
             },
             ...touch(),
         },
