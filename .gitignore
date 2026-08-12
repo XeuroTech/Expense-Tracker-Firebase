@@ -12,4 +12,6 @@ npm-debug.log
 # Never commit: service account keys, credentials
 *serviceAccount*.json
 *service-account*.json
+# Firebase Console's default download name: <project-id>-firebase-adminsdk-*.json
+*firebase-adminsdk*.json
 .env.local

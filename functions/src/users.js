@@ -163,6 +163,39 @@ const syncPublicProfile = onDocumentWritten(
 );
 
 /**
+ * Explicit "make my profile match my current Auth record" sync.
+ *
+ * ── WHY THIS EXISTS — A CONFIRMED RACE, NOT A HYPOTHETICAL ONE ─────────────────
+ * `onUserCreated` above reads `user.displayName` off the CREATE event's snapshot.
+ * The client's own registration flow calls `createUserWithEmailAndPassword` and
+ * THEN `updateProfile({ displayName })` a moment later — and there is no ordering
+ * guarantee between that second client call landing and this trigger firing on
+ * the first. Verified against live data: every `public_profiles` document had
+ * `name` / `name_lower` as an empty string, which made name-based search
+ * (`searchUsers` below) structurally unable to match anyone, ever.
+ *
+ * This callable is the fix, not a new trust boundary: it still never accepts a
+ * client-supplied name string, only re-reads FROM Auth (`auth.getUser`). Firebase
+ * Auth writes are strongly consistent, so by the time the client's own
+ * `updateProfile` promise has resolved — which it has, because the client only
+ * calls this immediately after that — this read is GUARANTEED to see it. Call
+ * once, right after `updateProfile`, from the registration flow.
+ *
+ * The write goes to `users/{uid}` only; `syncPublicProfile`'s trigger propagates
+ * it to `public_profiles/{uid}` from there, so there is exactly one writer of
+ * the searchable mirror, matching the header note on that trigger.
+ */
+const syncMyProfile = onCall({ region: REGION, maxInstances: 10 }, async (request) => {
+    const uid = requireAuth(request);
+    const record = await auth.getUser(uid);
+    await db.collection('users').doc(uid).set(
+        { name: record.displayName || '', email: record.email || '', ...touch() },
+        { merge: true }
+    );
+    return { success: true };
+});
+
+/**
  * User search.
  *
  * Runs with the Admin SDK inside a callable because `public_profiles` is
@@ -283,6 +316,7 @@ module.exports = {
     onUserCreated,
     onUserDeleted,
     syncPublicProfile,
+    syncMyProfile,
     searchUsers,
     toPublicProfile,
     resolveRelationships,

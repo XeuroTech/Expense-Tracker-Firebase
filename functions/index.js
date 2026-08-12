@@ -61,6 +61,7 @@ const aiSmartAdd = require('./src/aiSmartAdd');
 exports.onUserCreated = users.onUserCreated;
 exports.onUserDeleted = users.onUserDeleted;
 exports.syncPublicProfile = users.syncPublicProfile;
+exports.syncMyProfile = users.syncMyProfile;
 exports.searchUsers = users.searchUsers;
 
 // --- friends ----------------------------------------------------------------
