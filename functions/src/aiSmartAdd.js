@@ -53,6 +53,7 @@ const {
     stamps,
     touch,
     withLogging,
+    logEvent,
     assertRateLimit,
 } = require('./common');
 const {
@@ -790,11 +791,21 @@ const callGroq = async (prompt, wallets, categories, payees, budgets, recurringP
                 response_format: { type: 'json_object' },
             }),
         });
-    } catch {
+    } catch (err) {
+        // Logged server-side only — the client still gets the generic domain code.
+        logEvent('aiSmartAdd.callGroq', 'failure', { reason: 'fetch_threw', errorMessage: err && err.message, errorName: err && err.name });
         throw fail('AI_SERVICE_REQUEST_FAILED', 502);
     }
 
-    if (!response.ok) throw fail('AI_SERVICE_REQUEST_FAILED', 502);
+    if (!response.ok) {
+        const bodyText = await response.text().catch(() => '');
+        logEvent('aiSmartAdd.callGroq', 'failure', {
+            reason: 'non_ok_response',
+            httpStatus: response.status,
+            bodySnippet: bodyText.slice(0, 300),
+        });
+        throw fail('AI_SERVICE_REQUEST_FAILED', 502);
+    }
 
     const payload = await response.json();
     const content = payload?.choices?.[0]?.message?.content;
