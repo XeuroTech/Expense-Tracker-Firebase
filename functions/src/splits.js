@@ -75,6 +75,35 @@ const rethrowDomain = (error) => {
 const walletRef = (uid, walletId) =>
     db.collection('users').doc(uid).collection('wallets').doc(walletId);
 
+/**
+ * Mirrors `friends.js`'s `profileSummary`/`loadProfile` — the frontend's
+ * `AppUserSummary` shape ({userId, name, email, avatarId}), same as
+ * `create_split_expense`/`respond_split_request`'s `toPublicUser` on the
+ * Appwrite side (backend/functions/respond_split_request/src/main.js:1303-1307).
+ * `getSplitDetail` and `listSplitRequests` below MUST attach this to every
+ * member and to `creator`/`counterparty` — the detail screen reads
+ * `data.creator.name` and `member.user.name` with no optional chaining, so a
+ * response missing either is a hard crash, not a degraded render.
+ */
+const loadProfile = async (uid) => {
+    const snapshot = await db.collection('public_profiles').doc(uid).get();
+    return snapshot.exists ? snapshot.data() : null;
+};
+
+const profileSummary = (uid, profile) => ({
+    userId: uid,
+    name: (profile && profile.name) || '',
+    email: (profile && profile.email) || '',
+    avatarId: (profile && profile.avatarId) || null,
+});
+
+/** Loads every profile in `uids` once each, returned as a Map keyed by uid. */
+const loadProfiles = async (uids) => {
+    const unique = Array.from(new Set(uids.filter(Boolean)));
+    const profiles = await Promise.all(unique.map((uid) => loadProfile(uid)));
+    return new Map(unique.map((uid, i) => [uid, profiles[i]]));
+};
+
 // ---------------------------------------------------------------------------
 // createSplitExpense
 // ---------------------------------------------------------------------------
@@ -624,15 +653,31 @@ const getSplitDetail = async (uid, data) => {
         throw fail('MISSING_SPLIT', 404);
     }
 
-    const members = await db
+    const membersSnapshot = await db
         .collection('split_members')
         .where('split_expense_id', '==', resolvedSplitId)
         .get();
+    const memberDocs = membersSnapshot.docs.map((doc) => ({ $id: doc.id, ...doc.data() }));
+
+    const profiles = await loadProfiles([
+        splitData.created_by_user_id,
+        ...memberDocs.map((member) => member.member_user_id),
+    ]);
+
+    const members = memberDocs.map((member) => ({
+        ...member,
+        user: profileSummary(member.member_user_id, profiles.get(member.member_user_id)),
+    }));
+
+    const creator = profileSummary(splitData.created_by_user_id, profiles.get(splitData.created_by_user_id));
+    const currentUserMember = members.find((member) => member.member_user_id === uid) || null;
 
     return {
         success: true,
         splitExpense: { $id: split.id, ...splitData },
-        splitMembers: members.docs.map((doc) => ({ $id: doc.id, ...doc.data() })),
+        members,
+        currentUserMember,
+        creator,
     };
 };
 
@@ -668,6 +713,12 @@ const listSplitRequests = async (uid, data) => {
         }
     }
 
+    const memberDocsForProfiles = asMember.docs.map((doc) => doc.data());
+    const profiles = await loadProfiles([
+        ...Array.from(splits.values()).map((s) => s.created_by_user_id),
+        ...memberDocsForProfiles.map((m) => m.member_user_id),
+    ]);
+
     const sent = [];
     const received = [];
 
@@ -676,12 +727,24 @@ const listSplitRequests = async (uid, data) => {
         const splitData = splits.get(memberData.split_expense_id);
         if (!splitData) continue;
 
+        const direction = splitData.created_by_user_id === uid ? 'sent' : 'received';
+        // Mirrors `mapSplitRequestItem` (respond_split_request/src/main.js:945-963):
+        // counterparty is the FRIEND side of the row — the member when I'm the
+        // creator looking outward ('sent'), the creator when I'm the member
+        // looking back at whoever sent it ('received').
+        const creator = profileSummary(splitData.created_by_user_id, profiles.get(splitData.created_by_user_id));
+        const counterparty = direction === 'sent'
+            ? profileSummary(memberData.member_user_id, profiles.get(memberData.member_user_id))
+            : creator;
+
         const summary = {
             memberId: doc.id,
             splitExpenseId: memberData.split_expense_id,
-            direction: splitData.created_by_user_id === uid ? 'sent' : 'received',
+            direction,
             splitExpense: { $id: memberData.split_expense_id, ...splitData },
             member: { $id: doc.id, ...memberData },
+            creator,
+            counterparty,
         };
 
         if (summary.direction === 'sent') sent.push(summary);
