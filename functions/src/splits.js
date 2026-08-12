@@ -100,10 +100,16 @@ const createSplitExpenseHandler = async (request) => {
     if (!SPLIT_MODES.includes(splitMode)) throw fail('INVALID_SPLIT_MODE', 400);
     if (!PAYMENT_MODES.includes(paymentMode)) throw fail('INVALID_PAYMENT_MODE', 400);
 
-    const totalCents = toCents(input.totalAmount);
+    // The client (splitsAdapter.ts) sends `amount` / `walletId` — the SAME field
+    // names the frozen Appwrite contract uses (create_split_expense/src/main.js:2137,
+    // 2140: `body.amount`, `body.walletId`). `totalAmount` / `payerWalletId` were
+    // never sent by any client, so this always threw INVALID_AMOUNT regardless of
+    // what the user entered. Falling back to the old names too, just in case
+    // anything else already depends on them.
+    const totalCents = toCents(input.amount ?? input.totalAmount);
     if (!Number.isFinite(totalCents) || totalCents <= 0) throw fail('INVALID_AMOUNT', 400);
 
-    const payerWalletId = String(input.payerWalletId || '').trim();
+    const payerWalletId = String(input.walletId || input.payerWalletId || '').trim();
     if (!payerWalletId) throw fail('MISSING_WALLET', 400);
 
     // ── Idempotency layer 1: request_id ────────────────────────────────────────
