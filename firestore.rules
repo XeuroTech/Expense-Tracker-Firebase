@@ -133,11 +133,20 @@ service cloud.firestore {
     }
 
     // finance_sync's CLOUD_CREATE_ONLY_ATTRIBUTES (main.js:33-35).
-    // The wallet balance is authoritative in SQLite and recomputed from
-    // transactions; letting a stale client copy overwrite the mirror on every
-    // sync would make the mirror drift from the ledger.
+    //
+    // CORRECTED (companion to the frontend Phase 1 fix, RC-1): Appwrite's
+    // finance_sync/src/main.js does NOT actually enforce this restriction for
+    // wallets.current_balance -- that field is already unconditionally present
+    // in the base CLOUD_ATTRIBUTES.wallets allowlist there, so the create-only
+    // list is a no-op on the Appwrite side and current_balance is written
+    // through on every update in practice. There is also no recompute-from-
+    // transactions pass anywhere in this codebase -- current_balance is a
+    // single stored, client-incremented column on every provider. Enforcing
+    // create-only here (unlike Appwrite) caused every Firebase wallet balance
+    // update to be silently dropped and then reverted by the sync echo. See
+    // the Phase 1 forensic report in the frontend repo for the full trace.
     function createOnlyFields(c) {
-      return c == 'wallets' ? ['current_balance'] : [];
+      return [];
     }
 
     // Entitlement keys inside `users/{uid}.prefs`. Server-write-only.

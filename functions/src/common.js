@@ -139,6 +139,33 @@ const deterministicId = (...parts) => sha256(parts.map(String).join('::')).slice
 // ---------------------------------------------------------------------------
 
 /**
+ * Reads a timestamp-like value as epoch millis, whether it is a real Firestore
+ * `Timestamp` (has `.toMillis()`) or an ISO string. Returns 0 for anything else
+ * (missing, unparsable) so a caller comparing ages treats it as infinitely old
+ * rather than throwing.
+ */
+const toMillis = (value) => {
+    if (!value) return 0;
+    if (typeof value.toMillis === 'function') return value.toMillis();
+    const parsed = Date.parse(value);
+    return Number.isNaN(parsed) ? 0 : parsed;
+};
+
+/**
+ * Phase 3 (Task 1) — how long a `split_operations` mutex may sit `in_progress`
+ * before recovery is willing to consider the invocation that created it dead
+ * rather than merely slow.
+ *
+ * Every callable that can pass a `recovery` option below is registered with
+ * `onCall({ timeoutSeconds: 120, ... })`. Cloud Functions HARD-KILLS an
+ * instance at that ceiling — there is no way for an invocation to still be
+ * legitimately running past it. 150s (120s + a 30s margin for clock skew and
+ * Firestore write propagation) is therefore a age past which "the process that
+ * created this mutex is dead" is a certainty, not a guess.
+ */
+const MUTEX_STALE_AFTER_MS = 150 * 1000;
+
+/**
  * `split_operations` — the server-side mutex (C-SP-3, C-SP-4).
  *
  * ⚠️  `create()` IS LOAD BEARING. ⚠️
@@ -151,8 +178,41 @@ const deterministicId = (...parts) => sha256(parts.map(String).join('::')).slice
  * A completed operation REPLAYS its stored result rather than re-executing, so a
  * client retry after a network timeout returns the original outcome instead of
  * creating a second split or a second settlement.
+ *
+ * Phase 3 (Task 1) — optional `recovery` param, `{ checkCompleted, staleAfterMs }`.
+ *
+ * Omitted (as `createSplitExpense` still does — that mutex's crash-recovery gap is
+ * unchanged, out of Phase 3's stated scope): behavior is IDENTICAL to before this
+ * param existed.
+ *
+ * Supplied (as `respondSplitRequest`/`settleSplitPayment` do below): when a
+ * collision is hit against a mutex that is neither `completed` nor freshly
+ * `in_progress`, this closes the one real gap in the scheme above — a process that
+ * crashed or timed out AFTER its Firestore transaction committed but BEFORE the
+ * `ref.update({status:'completed',...})` a few lines down could run, leaving the
+ * mutex wedged `in_progress` forever with no way for a future retry to tell "already
+ * succeeded" apart from "never ran". `checkCompleted()` answers that by reading the
+ * ACTUAL financial state the handler would have produced (never the mutex) and
+ * returning the reconstructed result if it finds the operation's effect already
+ * committed, or `null` if it does not:
+ *
+ *   - `checkCompleted()` returns a result -> the transaction committed; only the
+ *     mutex's own bookkeeping write was lost. Repair that bookkeeping (a plain
+ *     `set(...,{merge:true})`, never a `create()`) and return the reconstructed
+ *     result. No financial write of any kind happens on this path.
+ *   - `checkCompleted()` returns null AND the mutex is older than `staleAfterMs`
+ *     -> no trace of this operation exists, and Cloud Functions' own timeout
+ *     guarantees whatever created this mutex is dead, not slow. Safe to reclaim:
+ *     delete the stale mutex and retry the acquisition from scratch, which lets a
+ *     genuinely fresh attempt execute `handler()`.
+ *   - `checkCompleted()` returns null AND the mutex is still within `staleAfterMs`
+ *     -> ambiguous: this could be a live, legitimately-running call. Recovering now
+ *     would race it. Refuse with the ordinary busy code, exactly as if `recovery`
+ *     had not been supplied — the caller's existing retry-after-a-moment path
+ *     already handles this, and the ambiguity resolves itself (to one of the two
+ *     cases above) once enough time passes.
  */
-const withOperationMutex = async (operationId, inProgressCode, handler) => {
+const withOperationMutex = async (operationId, inProgressCode, handler, recovery) => {
     const ref = db.collection('split_operations').doc(operationId);
 
     try {
@@ -169,6 +229,41 @@ const withOperationMutex = async (operationId, inProgressCode, handler) => {
 
         if (data.status === 'completed' && data.result) {
             return JSON.parse(data.result);
+        }
+
+        if (recovery && data.status === 'in_progress') {
+            const reconstructed = await recovery.checkCompleted();
+
+            if (reconstructed) {
+                // Case B — bookkeeping repair only. No financial write.
+                await ref.set(
+                    {
+                        status: 'completed',
+                        result: JSON.stringify(reconstructed),
+                        completedAt: FieldValue.serverTimestamp(),
+                        recoveredAt: FieldValue.serverTimestamp(),
+                        ...touch(),
+                    },
+                    { merge: true }
+                );
+                logEvent('operationMutexRecovery', 'success', { operationId, outcome: 'reconstructed' });
+                return reconstructed;
+            }
+
+            const ageMs = Date.now() - toMillis(data.startedAt);
+            const staleAfterMs = (recovery && recovery.staleAfterMs) || MUTEX_STALE_AFTER_MS;
+
+            if (ageMs >= staleAfterMs) {
+                // Case A — no financial trace, and the prior invocation is
+                // guaranteed dead (Cloud Functions' own timeoutSeconds ceiling).
+                // delete(), never set() — a third, still-live caller racing this
+                // same recovery must see a clean create() collision, not a
+                // silently overwritten mutex.
+                await ref.delete().catch(() => undefined);
+                logEvent('operationMutexRecovery', 'success', { operationId, outcome: 'reclaimed', ageMs });
+                return withOperationMutex(operationId, inProgressCode, handler, recovery);
+            }
+            // Case C — ambiguous; fall through to the ordinary busy response.
         }
 
         throw fail(inProgressCode, 409);

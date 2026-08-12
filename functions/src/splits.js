@@ -42,6 +42,7 @@ const {
     deterministicId,
     withOperationMutex,
     withLogging,
+    logEvent,
     stamps,
     touch,
     toCents,
@@ -64,7 +65,20 @@ const MAX_PARTICIPANTS = 100;
 const REQUEST_ID_MAX_LENGTH = 128;
 
 const SPLIT_MODES = ['equal', 'exact', 'percent'];
-const PAYMENT_MODES = ['own_share', 'full'];
+// Phase 2 fix (RC-SPLIT-1): this was `['own_share', 'full']`. The frontend's
+// canonical enum (`frontend/src/types/appwrite.ts`'s `SplitPaymentMode`) and the
+// Appwrite reference implementation both use `'creator_paid_full'`, never `'full'`
+// -- the frontend sends `'creator_paid_full'` unconditionally, for both providers
+// (`splitExpenseService.ts` builds one payload, no per-provider value translation
+// exists anywhere). `'full'` was never a value either provider could actually
+// produce or accept, so every "I Paid Full" create request was rejected here
+// before any read/write/lock. Checked before this change: no test file, doc, or
+// other source in this codebase references `payment_mode`/`PAYMENT_MODES`
+// containing the literal `'full'` as a stored value, and the only code path that
+// could ever have WRITTEN `payment_mode: 'full'` to Firestore is this same
+// validation, which always rejected it first -- so no existing record can hold
+// that value, and no read-side/legacy compatibility shim is needed for it.
+const PAYMENT_MODES = ['own_share', 'creator_paid_full'];
 
 /** Re-raises a splitMath error as an HttpsError while keeping the domain code. */
 const rethrowDomain = (error) => {
@@ -180,7 +194,7 @@ const createSplitExpenseHandler = async (request) => {
         const { creatorShareCents, friendShares } = shares;
 
         // What the creator actually pays out of their wallet now.
-        const paidCents = paymentMode === 'full' ? totalCents : creatorShareCents;
+        const paidCents = paymentMode === 'creator_paid_full' ? totalCents : creatorShareCents;
 
         const splitExpenseRef = db.collection('split_expenses').doc();
         const transactionRef = db
@@ -260,7 +274,7 @@ const createSplitExpenseHandler = async (request) => {
                     share_percent: friend.sharePercent,
                     paid_amount: 0,
                     // Owed only if the creator actually fronted the money.
-                    owed_amount: paymentMode === 'full' ? fromCents(friend.shareCents) : 0,
+                    owed_amount: paymentMode === 'creator_paid_full' ? fromCents(friend.shareCents) : 0,
                     settlement_status: 'pending',
                     settlement_wallet_id: null,
                     settlement_transaction_id: null,
@@ -377,6 +391,24 @@ const assertMutualFriends = async (uid, friendUids) => {
 // respondSplitRequest — respond | get_detail | list_requests
 // ---------------------------------------------------------------------------
 
+/**
+ * Fetches a split + its members in the standard response shape. Shared by the
+ * idempotent-replay short-circuit and the normal post-transaction return so the
+ * caller cannot tell which path produced the response (Phase 2 / RC-SPLIT-2).
+ */
+const fetchSplitResponsePayload = async (splitExpenseId) => {
+    const [split, members] = await Promise.all([
+        db.collection('split_expenses').doc(splitExpenseId).get(),
+        db.collection('split_members').where('split_expense_id', '==', splitExpenseId).get(),
+    ]);
+
+    return {
+        success: true,
+        splitExpense: { $id: split.id, ...split.data() },
+        splitMembers: members.docs.map((doc) => ({ $id: doc.id, ...doc.data() })),
+    };
+};
+
 const respondSplitRequestHandler = async (request) => {
     const uid = requireAuth(request);
     const action = (request.data && request.data.action) || 'respond';
@@ -392,17 +424,48 @@ const respondSplitRequestHandler = async (request) => {
 
     const splitMemberId = String((request.data && request.data.splitMemberId) || '').trim();
     const response = request.data && request.data.response;
+    // Phase 2 (RC-SPLIT-2): the wallet the responding member pays from (own_share)
+    // or intends to pay from later (creator_paid_full). Mirrors
+    // `respond_split_request/src/main.js:1687` (`body.walletId || body.wallet_id`) —
+    // the frontend already sends this field unconditionally on accept
+    // (`app/splits/[id].tsx`'s `handleRespond`, `splitExpenseService.ts`'s
+    // `respondSplitRequest`), for both providers. This handler simply never read it.
+    const walletId = String((request.data && request.data.walletId) || (request.data && request.data.wallet_id) || '').trim();
 
     if (!splitMemberId) throw fail('MISSING_SPLIT_MEMBER', 400);
     if (response !== 'accept' && response !== 'reject') throw fail('INVALID_RESPONSE', 400);
 
+    const memberRef = db.collection('split_members').doc(splitMemberId);
+
+    // Phase 2 (RC-SPLIT-2) idempotency layer, mirroring Appwrite's
+    // `getCompletedResponsePayload` short-circuit (`respond_split_request/src/main.js:1609`):
+    // a member who has already answered replays the CURRENT state as a success,
+    // rather than throwing. A legitimate retry (double-tap, client timeout after
+    // the server actually committed, duplicate network delivery) must see success,
+    // not an error — and must never re-enter the money-moving branch below. This
+    // is a plain read outside any transaction, exactly like Appwrite's own
+    // pre-mutex check; it does not touch `withOperationMutex` or the mutex
+    // document lifecycle at all (that mechanism, and its Phase-3 stuck-lock gap,
+    // is unchanged).
+    const preCheck = await memberRef.get();
+    if (!preCheck.exists) throw fail('INVALID_SETTLEMENT_MEMBER', 404);
+    if (preCheck.data().member_user_id !== uid) throw fail('MEMBER_OWNERSHIP_MISMATCH', 403);
+    if (preCheck.data().settlement_status !== 'pending') {
+        return fetchSplitResponsePayload(preCheck.data().split_expense_id);
+    }
+
+    if (response === 'accept' && !walletId) {
+        // Appwrite requires a wallet on accept for BOTH modes — own_share debits it
+        // now, creator_paid_full only records it for the later settlement step —
+        // mirrored here rather than inventing a Firebase-specific relaxation.
+        throw fail('WALLET_REQUIRED_FOR_SPLIT_RESPONSE', 400);
+    }
+
     const operationId = deterministicId('split_respond', uid, splitMemberId, response);
 
     return withOperationMutex(operationId, 'SPLIT_CREATE_ALREADY_IN_PROGRESS', async () => {
-        const memberRef = db.collection('split_members').doc(splitMemberId);
-
         const outcome = await db.runTransaction(async (tx) => {
-            // ---- READ PHASE ----
+            // ---- READ PHASE (nothing may be written before this completes) ----
             const member = await tx.get(memberRef);
             if (!member.exists) throw fail('INVALID_SETTLEMENT_MEMBER', 404);
 
@@ -410,8 +473,10 @@ const respondSplitRequestHandler = async (request) => {
             if (memberData.member_user_id !== uid) throw fail('MEMBER_OWNERSHIP_MISMATCH', 403);
 
             // The state machine has no re-entry: a member who has already answered
-            // cannot answer again. Without this an "accept" could follow a "reject"
-            // and re-create an obligation the user already declined.
+            // cannot answer again. The pre-check above already handles the common
+            // "already answered" case gracefully; this is the same guard re-run
+            // inside the transaction to close the narrow window between that read
+            // and this one (e.g. a concurrent accept that commits in between).
             if (memberData.settlement_status !== 'pending') {
                 throw fail('SPLIT_ALREADY_SETTLED', 409);
             }
@@ -419,18 +484,102 @@ const respondSplitRequestHandler = async (request) => {
             const splitRef = db.collection('split_expenses').doc(memberData.split_expense_id);
             const split = await tx.get(splitRef);
             if (!split.exists) throw fail('MISSING_SPLIT', 404);
+            const splitData = split.data();
+
+            if (response === 'accept' && !PAYMENT_MODES.includes(splitData.payment_mode)) {
+                throw fail('INVALID_PAYMENT_MODE', 400);
+            }
+            const isOwnShareAccept = response === 'accept' && splitData.payment_mode === 'own_share';
+
+            // Only accept reads a wallet at all — reject never touches money.
+            let wallet = null;
+            let currentBalance = 0;
+            if (response === 'accept') {
+                wallet = await tx.get(walletRef(uid, walletId));
+                if (!wallet.exists) throw fail('WALLET_NOT_FOUND', 404);
+                currentBalance = Number(wallet.data().current_balance || 0);
+            }
+
+            let shareAmount = 0;
+            let paymentTxnRef = null;
+            if (isOwnShareAccept) {
+                // Mirrors `respond_split_request/src/main.js:1682`: the amount
+                // charged on accept is the member's SHARE, not `owed_amount` — for
+                // own_share members `owed_amount` is 0 at creation by design (the
+                // creator fronted nothing for them), and accepting is itself the
+                // payment.
+                shareAmount = fromCents(toCents(memberData.share_amount));
+                if (!Number.isFinite(shareAmount) || shareAmount <= 0) {
+                    throw fail('INVALID_SPLIT_SHARE', 400);
+                }
+
+                // C-SP-6 — the floor, checked inside this same transaction
+                // immediately before the write, exactly like createSplitExpenseHandler.
+                // A bare FieldValue.increment(-x) cannot express this refusal.
+                if (currentBalance < shareAmount) throw fail('INSUFFICIENT_BALANCE', 400);
+
+                // Deterministic — retries of this same accept (mutex replay aside)
+                // can never mint a second transaction document for it.
+                paymentTxnRef = db
+                    .collection('users')
+                    .doc(uid)
+                    .collection('transactions')
+                    .doc(deterministicId('split_pay_txn', splitMemberId).slice(0, 20));
+            }
 
             const now = new Date().toISOString();
 
             // ---- WRITE PHASE ----
-            tx.update(memberRef, {
-                settlement_status: response === 'accept' ? 'accepted' : 'rejected',
-                updated_at: now,
-                ...touch(),
-            });
+            const memberUpdate = { updated_at: now, ...touch() };
+
+            if (response === 'reject') {
+                // Canonical value: `SettlementStatus.Cancelled` ('cancelled'), not
+                // 'rejected' — that string does not exist in the shared enum
+                // (frontend/src/types/appwrite.ts) or in Appwrite's actual state
+                // machine (respond_split_request/src/main.js:1670).
+                memberUpdate.settlement_status = 'cancelled';
+            } else if (isOwnShareAccept) {
+                tx.set(paymentTxnRef, {
+                    amount: shareAmount,
+                    type: 'expense',
+                    wallet_id: walletId,
+                    category_id: splitData.category_id || null,
+                    date: splitData.date || now,
+                    note: String(splitData.title || 'Split expense').slice(0, 200),
+                    source: 'split_expense',
+                    splitExpenseId: splitRef.id,
+                    splitMemberId,
+                    user_id: uid,
+                    ...stamps(),
+                });
+
+                tx.update(walletRef(uid, walletId), {
+                    current_balance: applyBalanceDelta(currentBalance, -shareAmount),
+                    ...touch(),
+                });
+
+                // Canonical value: 'settled' (respond_split_request/src/main.js:1766)
+                // — accepting an own_share split IS the payment; no later
+                // settlement step ever follows for this member.
+                memberUpdate.settlement_status = 'settled';
+                memberUpdate.paid_amount = shareAmount;
+                memberUpdate.owed_amount = 0;
+                memberUpdate.settled_at = now;
+                memberUpdate.settlement_transaction_id = paymentTxnRef.id;
+                memberUpdate.settlement_wallet_id = walletId;
+            } else {
+                // creator_paid_full accept: no money moves here. Canonical value:
+                // 'unsettled' (respond_split_request/src/main.js:1784) — the friend
+                // has acknowledged the debt; settleSplitPayment moves the money
+                // later, when the creator marks it received.
+                memberUpdate.settlement_status = 'unsettled';
+                memberUpdate.settlement_wallet_id = walletId;
+            }
+
+            tx.update(memberRef, memberUpdate);
 
             addNotificationToBatch(tx, {
-                userId: split.data().created_by_user_id,
+                userId: splitData.created_by_user_id,
                 type: response === 'accept' ? 'split_accepted' : 'split_rejected',
                 title: response === 'accept' ? 'Split accepted' : 'Split declined',
                 body:
@@ -441,23 +590,41 @@ const respondSplitRequestHandler = async (request) => {
                 relatedDocumentId: splitRef.id,
                 splitExpenseId: splitRef.id,
                 splitMemberId,
-                participantIds: split.data().participantIds || [uid],
+                participantIds: splitData.participantIds || [uid],
                 dedupeKey: `split_response:${splitMemberId}:${response}`,
             });
 
             return { splitExpenseId: splitRef.id };
         });
 
-        const [split, members] = await Promise.all([
-            db.collection('split_expenses').doc(outcome.splitExpenseId).get(),
-            db.collection('split_members').where('split_expense_id', '==', outcome.splitExpenseId).get(),
-        ]);
+        return fetchSplitResponsePayload(outcome.splitExpenseId);
+    }, {
+        // Phase 3 (Task 1): distinguishes "this accept/reject never committed"
+        // from "it committed, but the mutex's own completion write never
+        // landed" -- see `withOperationMutex`'s `recovery` param in common.js
+        // for the full contract. Reads the ACTUAL member state rather than
+        // trusting the mutex, and reports success only for a state THIS
+        // response value could actually have produced: a stuck 'accept' mutex
+        // must never be reported as completed off the back of a DIFFERENT
+        // response ('reject') having won a genuine race for the same member
+        // -- `'cancelled'` can only come from a committed reject, and
+        // `'settled'`/`'unsettled'` can only come from a committed accept
+        // (the transaction's own re-entry guard above prevents either from
+        // ever being written by the other response value).
+        checkCompleted: async () => {
+            const snap = await memberRef.get();
+            if (!snap.exists) return null;
+            const status = snap.data().settlement_status;
+            if (status === 'pending') return null;
 
-        return {
-            success: true,
-            splitExpense: { $id: split.id, ...split.data() },
-            splitMembers: members.docs.map((doc) => ({ $id: doc.id, ...doc.data() })),
-        };
+            if (response === 'reject') {
+                if (status !== 'cancelled') return null;
+            } else if (status !== 'settled' && status !== 'unsettled') {
+                return null;
+            }
+
+            return fetchSplitResponsePayload(snap.data().split_expense_id);
+        },
     });
 };
 
@@ -493,9 +660,12 @@ const settleSplitPaymentHandler = async (request) => {
     // while a genuinely different amount is a different operation.
     const operationId = deterministicId('settle', uid, splitMemberId, toCents(amount));
 
-    return withOperationMutex(operationId, 'SETTLEMENT_ALREADY_PROCESSING', async () => {
-        const memberRef = db.collection('split_members').doc(splitMemberId);
+    // Hoisted above `withOperationMutex` (Phase 3 / Task 1) so the recovery
+    // callback below can read the same member document without duplicating
+    // the reference construction.
+    const memberRef = db.collection('split_members').doc(splitMemberId);
 
+    return withOperationMutex(operationId, 'SETTLEMENT_ALREADY_PROCESSING', async () => {
         const outcome = await db.runTransaction(async (tx) => {
             // ---- READ PHASE ----
             const member = await tx.get(memberRef);
@@ -512,6 +682,16 @@ const settleSplitPaymentHandler = async (request) => {
             if (splitData.created_by_user_id !== uid) {
                 throw fail('ONLY_CREATOR_CAN_MARK_RECEIVED', 403);
             }
+            // Phase 2 fix: mirrors settle_split_payment/src/main.js's
+            // SETTLEMENT_ONLY_FOR_CREATOR_PAID_FULL guard. own_share members are
+            // never payable through this function (accepting IS their payment,
+            // handled entirely in respondSplitRequestHandler) — their owed_amount
+            // is always 0, so the amount-match check below would already refuse
+            // them, but this makes the reason explicit instead of surfacing as a
+            // confusing SETTLEMENT_AMOUNT_MISMATCH.
+            if (splitData.payment_mode !== 'creator_paid_full') {
+                throw fail('SETTLEMENT_ONLY_FOR_CREATOR_PAID_FULL', 400);
+            }
             if (memberData.settlement_status === 'settled') {
                 throw fail('SPLIT_ALREADY_SETTLED', 409);
             }
@@ -521,20 +701,55 @@ const settleSplitPaymentHandler = async (request) => {
             const owedCents = toCents(memberData.owed_amount || memberData.share_amount || 0);
             if (toCents(amount) !== owedCents) throw fail('SETTLEMENT_AMOUNT_MISMATCH', 400);
 
-            const wallet = await tx.get(walletRef(uid, receivingWalletId));
-            if (!wallet.exists) throw fail('RECEIVING_WALLET_NOT_FOUND', 404);
+            // Phase 2 fix (previously missing entirely): the FRIEND's own wallet,
+            // recorded on `settlement_wallet_id` when they accepted
+            // (respondSplitRequestHandler's creator_paid_full branch). Without it
+            // there is nowhere to debit — mirrors Appwrite's
+            // MEMBER_SETTLEMENT_WALLET_NOT_FOUND guard
+            // (settle_split_payment/src/main.js:1220-1222).
+            const memberWalletId = String(memberData.settlement_wallet_id || '').trim();
+            if (!memberWalletId) throw fail('MEMBER_SETTLEMENT_WALLET_NOT_FOUND', 400);
 
-            const currentBalance = Number(wallet.data().current_balance || 0);
+            const receivingWallet = await tx.get(walletRef(uid, receivingWalletId));
+            if (!receivingWallet.exists) throw fail('RECEIVING_WALLET_NOT_FOUND', 404);
+            const receivingBalance = Number(receivingWallet.data().current_balance || 0);
+
+            // Phase 2 fix: read the friend's wallet too — this handler previously
+            // never touched it, so the friend's side of the transfer never
+            // happened at all (the creator was credited; the friend was never
+            // debited). `memberData.member_user_id` scopes this to the FRIEND's
+            // own subcollection, structurally preventing any cross-user access —
+            // same pattern as every other wallet reference in this file.
+            const memberWallet = await tx.get(walletRef(memberData.member_user_id, memberWalletId));
+            if (!memberWallet.exists) throw fail('MEMBER_SETTLEMENT_WALLET_NOT_FOUND', 404);
+            const memberBalance = Number(memberWallet.data().current_balance || 0);
+
+            // C-SP-6 — the floor, checked inside this same transaction immediately
+            // before the write, exactly like createSplitExpenseHandler and
+            // respondSplitRequestHandler's own_share branch.
+            if (memberBalance < amount) throw fail('INSUFFICIENT_BALANCE', 400);
+
             const now = new Date().toISOString();
 
-            const settlementTxnRef = db
+            // Two deterministic IDs, one per side of the transfer — mirrors
+            // settle_split_payment/src/main.js:1217-1219
+            // (`deterministicId('settlement', '<memberId>:creator' / ':member')`).
+            // Neither depends on `amount`: a member can only ever be settled once
+            // for their one fixed `owed_amount`, so the extra entropy the previous
+            // single-ID scheme included was redundant, not protective.
+            const creatorSettlementTxnRef = db
                 .collection('users')
                 .doc(uid)
                 .collection('transactions')
-                .doc(deterministicId('settle_txn', splitMemberId, toCents(amount)).slice(0, 20));
+                .doc(deterministicId('settle_txn', splitMemberId, 'creator').slice(0, 20));
+            const memberSettlementTxnRef = db
+                .collection('users')
+                .doc(memberData.member_user_id)
+                .collection('transactions')
+                .doc(deterministicId('settle_txn', splitMemberId, 'member').slice(0, 20));
 
             // ---- WRITE PHASE ----
-            tx.set(settlementTxnRef, {
+            tx.set(creatorSettlementTxnRef, {
                 amount,
                 type: 'income',
                 wallet_id: receivingWalletId,
@@ -546,16 +761,39 @@ const settleSplitPaymentHandler = async (request) => {
                 user_id: uid,
                 ...stamps(),
             });
+            // Phase 2 fix (previously missing entirely): the friend's own expense
+            // transaction for paying their share back.
+            tx.set(memberSettlementTxnRef, {
+                amount,
+                type: 'expense',
+                wallet_id: memberWalletId,
+                date: now,
+                note: 'Split settlement paid',
+                source: 'split_settlement',
+                splitExpenseId: splitRef.id,
+                splitMemberId,
+                user_id: memberData.member_user_id,
+                ...stamps(),
+            });
 
             tx.update(walletRef(uid, receivingWalletId), {
-                current_balance: applyBalanceDelta(currentBalance, amount),
+                current_balance: applyBalanceDelta(receivingBalance, amount),
+                ...touch(),
+            });
+            // Phase 2 fix (previously missing entirely): debit the friend.
+            tx.update(walletRef(memberData.member_user_id, memberWalletId), {
+                current_balance: applyBalanceDelta(memberBalance, -amount),
                 ...touch(),
             });
 
             tx.update(memberRef, {
                 settlement_status: 'settled',
-                settlement_wallet_id: receivingWalletId,
-                settlement_transaction_id: settlementTxnRef.id,
+                // `settlement_wallet_id` is intentionally NOT written here — it
+                // already holds the friend's wallet, recorded at accept time.
+                // The previous code overwrote it with the CREATOR's receiving
+                // wallet, corrupting the record of whose wallet it was.
+                settlement_transaction_id: creatorSettlementTxnRef.id,
+                member_settlement_transaction_id: memberSettlementTxnRef.id,
                 paid_amount: amount,
                 owed_amount: 0,
                 settled_at: now,
@@ -579,18 +817,42 @@ const settleSplitPaymentHandler = async (request) => {
             return { splitExpenseId: splitRef.id };
         });
 
-        await maybeCloseSplit(outcome.splitExpenseId);
+        // Phase 3 (Task 1/3 pairing): `maybeCloseSplit` only derives a status
+        // from members that already exist -- it never moves money, so a
+        // failure here (e.g. exhausting Firestore's transaction retry budget
+        // under heavy contention) must not cost the caller a settlement that
+        // already committed, or worse, be allowed to throw out of this
+        // handler and have `withOperationMutex`'s failure path DELETE the
+        // mutex for a payment that already succeeded. See `maybeCloseSplitSafely`.
+        await maybeCloseSplitSafely(outcome.splitExpenseId);
 
-        const [split, members] = await Promise.all([
-            db.collection('split_expenses').doc(outcome.splitExpenseId).get(),
-            db.collection('split_members').where('split_expense_id', '==', outcome.splitExpenseId).get(),
-        ]);
+        return fetchSplitResponsePayload(outcome.splitExpenseId);
+    }, {
+        // Phase 3 (Task 1): same contract as respondSplitRequestHandler's
+        // `checkCompleted` above. `settlement_status === 'settled'` alone is
+        // not quite enough proof THIS operationId (uid, splitMemberId,
+        // amount) is what produced it -- confirming the deterministic
+        // creator-side settlement transaction this exact handler would have
+        // created also exists removes any doubt, at the cost of one extra
+        // read, reusing the identical id-construction the handler itself
+        // uses a few lines up.
+        checkCompleted: async () => {
+            const snap = await memberRef.get();
+            if (!snap.exists) return null;
+            const memberData = snap.data();
+            if (memberData.settlement_status !== 'settled') return null;
 
-        return {
-            success: true,
-            splitExpense: { $id: split.id, ...split.data() },
-            splitMembers: members.docs.map((doc) => ({ $id: doc.id, ...doc.data() })),
-        };
+            const creatorSettlementTxnRef = db
+                .collection('users')
+                .doc(uid)
+                .collection('transactions')
+                .doc(deterministicId('settle_txn', splitMemberId, 'creator').slice(0, 20));
+            const creatorTxnSnap = await creatorSettlementTxnRef.get();
+            if (!creatorTxnSnap.exists) return null;
+
+            await maybeCloseSplitSafely(memberData.split_expense_id);
+            return fetchSplitResponsePayload(memberData.split_expense_id);
+        },
     });
 };
 
@@ -604,25 +866,96 @@ const settleSplitPayment = onCall({ region: REGION, timeoutSeconds: 120, maxInst
         () => settleSplitPaymentHandler(request)
     ));
 
-/** Marks a split settled once no member is still outstanding. */
+/**
+ * Marks a split settled once no required member is still outstanding.
+ *
+ * Phase 3 (Task 3): rewritten as a single Firestore transaction, scoped to
+ * exactly this `splitExpenseId` -- read the split + its members, decide, and
+ * (only if closing) write, all inside one atomic boundary, instead of the
+ * previous plain read-then-write. Two concurrent settlements for DIFFERENT
+ * members of the SAME split each call this after their own member write has
+ * already committed; if one call's read happens to land before the other's
+ * commit, Firestore's own contention detection on the member QUERY this
+ * transaction reads forces a retry against fresh state rather than a decision
+ * on stale data (the same "read everything -> compute -> write everything"
+ * discipline the file header describes, and the same reason the Appwrite
+ * saga's rollback machinery is unnecessary here). This only ever touches
+ * `splitExpenseId`'s own split + member documents, so unrelated splits never
+ * contend with each other (I8) -- there is no global lock anywhere in this
+ * function.
+ *
+ * Also fixes a Phase-2-introduced vocabulary bug: this used to compare a
+ * member's status against `'rejected'`, but Phase 2's respond fix changed
+ * what a declined response actually WRITES to the canonical `'cancelled'`
+ * (`SettlementStatus.Cancelled` -- `'rejected'` is not a value that enum
+ * has) without updating this check. A split with any declined member could
+ * therefore never auto-close, even after every other member settled, because
+ * `'cancelled'` satisfied neither branch of the old comparison.
+ *
+ * Reads members via `splitMemberRef(splitExpenseId, participantUid)` --
+ * deterministic doc refs built from `split_expenses.participantIds`, the
+ * SAME id-construction `createSplitExpenseHandler` uses to write each member
+ * -- rather than the `split_members` collection query the old version ran.
+ * Nothing else in this file reads a collection query inside a transaction;
+ * every other handler reads specific, deterministically-addressable
+ * documents. Staying inside that pattern here too means Firestore's
+ * per-document contention detection is exact, not query-shaped.
+ */
 const maybeCloseSplit = async (splitExpenseId) => {
-    const members = await db
-        .collection('split_members')
-        .where('split_expense_id', '==', splitExpenseId)
-        .get();
+    await db.runTransaction(async (tx) => {
+        const splitRef = db.collection('split_expenses').doc(splitExpenseId);
 
-    const outstanding = members.docs.some((doc) => {
-        const status = doc.data().settlement_status;
-        return status !== 'settled' && status !== 'rejected';
+        // ---- READ PHASE ----
+        const splitSnap = await tx.get(splitRef);
+        if (!splitSnap.exists) return;
+        const splitData = splitSnap.data();
+        // Idempotent no-op on replay -- also what makes it safe for the
+        // Task 1 recovery path above to call this unconditionally.
+        if (splitData.status === 'settled') return;
+
+        const participantIds = Array.isArray(splitData.participantIds) ? splitData.participantIds : [];
+        const memberRefs = participantIds.map((participantUid) => splitMemberRef(splitExpenseId, participantUid));
+        const memberSnaps = await Promise.all(memberRefs.map((memberRef) => tx.get(memberRef)));
+
+        const outstanding = memberSnaps.some((snap) => {
+            // A participant with no member row yet is never "settled" -- defensive,
+            // should not happen since every participant gets a row at create time.
+            if (!snap.exists) return true;
+            const status = snap.data().settlement_status;
+            return status !== 'settled' && status !== 'cancelled';
+        });
+        if (outstanding) return;
+
+        // ---- WRITE PHASE ----
+        const now = new Date().toISOString();
+        tx.set(
+            splitRef,
+            { status: 'settled', settled_at: now, updated_at: now, ...touch() },
+            { merge: true }
+        );
     });
+};
 
-    if (outstanding) return;
-
-    const now = new Date().toISOString();
-    await db.collection('split_expenses').doc(splitExpenseId).set(
-        { status: 'settled', settled_at: now, updated_at: now, ...touch() },
-        { merge: true }
-    );
+/**
+ * Phase 3 (Task 1 / Task 3 pairing) — see the call sites in
+ * `settleSplitPaymentHandler` above for why a `maybeCloseSplit` failure must
+ * never be allowed to propagate: it only ever derives `split_expenses.status`
+ * from members that already exist, never money, so it is always safe to log
+ * and move on rather than fail the caller or (worse) let
+ * `withOperationMutex`'s failure path delete a mutex for a payment that
+ * already committed. A stale status is self-healing -- the next call that
+ * touches this split recomputes it from scratch.
+ */
+const maybeCloseSplitSafely = async (splitExpenseId) => {
+    try {
+        await maybeCloseSplit(splitExpenseId);
+    } catch (error) {
+        logEvent('maybeCloseSplit', 'failure', {
+            splitExpenseId,
+            errorCategory: error && (error.code || error.errorInfo || 'unknown'),
+            errorMessage: error && error.message,
+        });
+    }
 };
 
 // ---------------------------------------------------------------------------
