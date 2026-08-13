@@ -49,6 +49,7 @@ const {
     fromCents,
     applyBalanceDelta,
     assertRateLimit,
+    runTransactionWithRetry,
 } = require('./common');
 const { calculateShares, assertValidShares } = require('./splitMath');
 const { addNotificationToBatch, writeNotification } = require('./notify');
@@ -228,7 +229,7 @@ const createSplitExpenseHandler = async (request) => {
         const participantIds = [uid, ...friendUids];
         const now = new Date().toISOString();
 
-        await db.runTransaction(async (tx) => {
+        await runTransactionWithRetry(async (tx) => {
             // ---- READ PHASE (nothing may be written before this completes) ----
             const wallet = await tx.get(walletRef(uid, payerWalletId));
             if (!wallet.exists) throw fail('MISSING_WALLET', 404);
@@ -341,7 +342,7 @@ const createSplitExpenseHandler = async (request) => {
                 current_balance: applyBalanceDelta(currentBalance, -paidAmount),
                 ...touch(),
             });
-        });
+        }, { maxAttempts: 15, maxDelayMs: 2000, baseDelayMs: 75 });
 
         const created = await splitExpenseRef.get();
         return { success: true, splitExpense: { $id: created.id, ...created.data() } };
@@ -488,7 +489,7 @@ const respondSplitRequestHandler = async (request) => {
     const operationId = deterministicId('split_respond', uid, splitMemberId, response);
 
     return withOperationMutex(operationId, 'SPLIT_CREATE_ALREADY_IN_PROGRESS', async () => {
-        const outcome = await db.runTransaction(async (tx) => {
+        const outcome = await runTransactionWithRetry(async (tx) => {
             // ---- READ PHASE (nothing may be written before this completes) ----
             const member = await tx.get(memberRef);
             if (!member.exists) throw fail('INVALID_SETTLEMENT_MEMBER', 404);
@@ -690,7 +691,7 @@ const settleSplitPaymentHandler = async (request) => {
     const memberRef = db.collection('split_members').doc(splitMemberId);
 
     return withOperationMutex(operationId, 'SETTLEMENT_ALREADY_PROCESSING', async () => {
-        const outcome = await db.runTransaction(async (tx) => {
+        const outcome = await runTransactionWithRetry(async (tx) => {
             // ---- READ PHASE ----
             const member = await tx.get(memberRef);
             if (!member.exists) throw fail('INVALID_SETTLEMENT_MEMBER', 404);

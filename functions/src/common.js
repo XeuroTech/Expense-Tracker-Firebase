@@ -289,6 +289,76 @@ const withOperationMutex = async (operationId, inProgressCode, handler, recovery
 };
 
 // ---------------------------------------------------------------------------
+// Firestore transaction retry — ABORTED / contention only
+// ---------------------------------------------------------------------------
+
+/** gRPC / Firestore codes that indicate transient transaction contention. */
+const RETRYABLE_TRANSACTION_CODES = new Set([
+    4,
+    10,
+    13,
+    14,
+    'deadline-exceeded',
+    'aborted',
+    'internal',
+    'unavailable',
+]);
+
+/** Domain/business errors from `fail()` must never be retried. */
+const isHttpsDomainError = (error) => error instanceof HttpsError;
+
+/**
+ * True when Firestore aborted a transaction due to lock contention or another
+ * transient infrastructure fault — NOT for INSUFFICIENT_BALANCE etc.
+ */
+const isRetryableTransactionError = (error) => {
+    if (!error || isHttpsDomainError(error)) return false;
+
+    const code =
+        typeof error.code === 'string' && /^\d+$/.test(error.code) ? Number(error.code) : error.code;
+    if (RETRYABLE_TRANSACTION_CODES.has(code)) return true;
+
+    const message = String(error.message || '');
+    return (
+        message.includes('Transaction lock timeout') ||
+        message.includes('ABORTED') ||
+        message.includes('contention')
+    );
+};
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Full jitter in [baseDelayMs, cap] — spreads concurrent wallet contenders. */
+const computeRetryDelayMs = (attempt, { baseDelayMs, maxDelayMs }) => {
+    const cap = Math.min(maxDelayMs, baseDelayMs * 2 ** attempt);
+    return baseDelayMs + Math.floor(Math.random() * Math.max(1, cap - baseDelayMs));
+};
+
+/**
+ * Runs `db.runTransaction` with bounded exponential backoff + jitter for ABORTED
+ * / contention errors. Aborted attempts commit nothing; retries reuse the same
+ * callback closure (same doc refs, same deterministic txn ids). HttpsError domain
+ * failures propagate immediately.
+ */
+const runTransactionWithRetry = async (updateFunction, options = {}) => {
+    const maxAttempts = options.maxAttempts ?? 12;
+    const baseDelayMs = options.baseDelayMs ?? 50;
+    const maxDelayMs = options.maxDelayMs ?? 1500;
+    const transactionOptions = options.transactionOptions;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+            return await db.runTransaction(updateFunction, transactionOptions);
+        } catch (error) {
+            if (!isRetryableTransactionError(error) || attempt >= maxAttempts) throw error;
+
+            const delayMs = computeRetryDelayMs(attempt, { baseDelayMs, maxDelayMs });
+            await sleep(delayMs);
+        }
+    }
+};
+
+// ---------------------------------------------------------------------------
 // Money
 // ---------------------------------------------------------------------------
 
@@ -425,29 +495,41 @@ const assertRateLimit = async (uid, operation, { max, windowMs }) => {
     const docId = deterministicId('rl', uid, operation, String(windowStart));
     const ref = db.collection(RATE_LIMIT_COLLECTION).doc(docId);
 
-    const allowed = await db.runTransaction(async (tx) => {
-        const snapshot = await tx.get(ref);
-        const count = (snapshot.exists && snapshot.data().count) || 0;
-        if (count >= max) return false;
+    for (let wave = 1; wave <= 5; wave++) {
+        try {
+            const allowed = await runTransactionWithRetry(
+                async (tx) => {
+                    const snapshot = await tx.get(ref);
+                    const count = (snapshot.exists && snapshot.data().count) || 0;
+                    if (count >= max) return false;
 
-        tx.set(
-            ref,
-            {
-                uid,
-                operation,
-                count: count + 1,
-                windowStart,
-                expires_at: Timestamp.fromMillis(windowStart + windowMs),
-                ...touch(),
-            },
-            { merge: true }
-        );
-        return true;
-    });
+                    tx.set(
+                        ref,
+                        {
+                            uid,
+                            operation,
+                            count: count + 1,
+                            windowStart,
+                            expires_at: Timestamp.fromMillis(windowStart + windowMs),
+                            ...touch(),
+                        },
+                        { merge: true }
+                    );
+                    return true;
+                },
+                { maxAttempts: 8, maxDelayMs: 1000, baseDelayMs: 40 }
+            );
 
-    if (!allowed) {
-        logEvent('rateLimit', 'failure', { operation, uid });
-        throw fail('RATE_LIMITED', 429, { retryAfterMs: windowStart + windowMs - Date.now() });
+            if (!allowed) {
+                logEvent('rateLimit', 'failure', { operation, uid });
+                throw fail('RATE_LIMITED', 429, { retryAfterMs: windowStart + windowMs - Date.now() });
+            }
+            return;
+        } catch (error) {
+            if (isHttpsDomainError(error)) throw error;
+            if (!isRetryableTransactionError(error) || wave >= 5) throw error;
+            await sleep(computeRetryDelayMs(wave, { baseDelayMs: 75, maxDelayMs: 1000 }));
+        }
     }
 };
 
@@ -474,6 +556,8 @@ module.exports = {
     pairKeyFor,
     deterministicId,
     withOperationMutex,
+    runTransactionWithRetry,
+    isRetryableTransactionError,
     toCents,
     fromCents,
     applyBalanceDelta,

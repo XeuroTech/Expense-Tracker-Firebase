@@ -158,6 +158,10 @@ service cloud.firestore {
               'subscriptionVerificationHash', 'billingCycle'];
     }
 
+    function mfaKeys() {
+      return ['mfa_enabled', 'mfa_recovery_code_hashes'];
+    }
+
     function hasOnlyAllowedFields(c) {
       return incoming().keys().hasOnly(allowedFields(c).concat(metadataFields()));
     }
@@ -200,13 +204,15 @@ service cloud.firestore {
       // `request.resource.data` on a merge write is the FULL merged document and
       // therefore always contains the subscription keys.
       allow create: if isOwner(uid)
-        && !incoming().get('prefs', {}).keys().hasAny(subscriptionKeys());
+        && !incoming().get('prefs', {}).keys().hasAny(subscriptionKeys())
+        && !incoming().keys().hasAny(mfaKeys());
 
       allow update: if isOwner(uid)
         && !incoming().get('prefs', {})
               .diff(existing().get('prefs', {}))
               .affectedKeys()
-              .hasAny(subscriptionKeys());
+              .hasAny(subscriptionKeys())
+        && !incoming().diff(existing()).affectedKeys().hasAny(mfaKeys());
 
       allow delete: if false;   // account deletion is a callable (Admin SDK)
 
@@ -329,6 +335,25 @@ service cloud.firestore {
     // Server-only. `otp_challenges` backs the email-change flow; document
     // existence in `purchase_tokens` IS the "already claimed" check.
     match /otp_challenges/{id} {
+      allow read, write: if false;
+    }
+
+    // Server-only. Tracks OTP verification state for the account-deletion flow.
+    match /account_deletion_state/{uid} {
+      allow read, write: if false;
+    }
+
+    // Server-only. Email MFA challenges and verification state.
+    match /mfa_challenges/{id} {
+      allow read, write: if false;
+    }
+
+    match /mfa_state/{uid} {
+      allow read, write: if false;
+    }
+
+    // Written by Cloud Functions when the Trigger Email extension is installed.
+    match /mail/{id} {
       allow read, write: if false;
     }
 

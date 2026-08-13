@@ -27,17 +27,28 @@
     width: 64px;
     height: 64px;
     border-radius: 32px;
-    background: rgba(46, 204, 113, 0.15);
-    border: 1px solid rgba(46, 204, 113, 0.4);
     display: flex;
     align-items: center;
     justify-content: center;
     margin: 0 auto 20px;
     font-size: 28px;
+    border: 1px solid transparent;
+  }
+  .icon.ok {
+    background: rgba(46, 204, 113, 0.15);
+    border-color: rgba(46, 204, 113, 0.4);
+  }
+  .icon.err {
+    background: rgba(239, 68, 68, 0.15);
+    border-color: rgba(239, 68, 68, 0.4);
+  }
+  .icon.wait {
+    background: rgba(255, 255, 255, 0.06);
+    border-color: rgba(255, 255, 255, 0.12);
   }
   h1 { font-size: 22px; margin: 0 0 10px; }
   p { color: #9aa4b2; font-size: 15px; line-height: 1.5; margin: 0 0 24px; }
-  a.button {
+  a.button, button.button {
     display: inline-block;
     background: #ff6b6b;
     color: #0b0f14;
@@ -46,23 +57,251 @@
     padding: 14px 28px;
     border-radius: 12px;
     font-size: 15px;
+    border: none;
+    cursor: pointer;
+    width: 100%;
+    box-sizing: border-box;
+  }
+  button.button:disabled {
+    opacity: 0.65;
+    cursor: not-allowed;
   }
   .hint { margin-top: 18px; font-size: 13px; color: #6b7480; }
+  .spinner {
+    width: 28px;
+    height: 28px;
+    border: 3px solid rgba(255,255,255,0.15);
+    border-top-color: #ff6b6b;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+    margin: 0 auto 20px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .form {
+    text-align: left;
+    margin-bottom: 16px;
+  }
+  label {
+    display: block;
+    font-size: 13px;
+    color: #9aa4b2;
+    margin-bottom: 6px;
+  }
+  input[type="password"] {
+    width: 100%;
+    box-sizing: border-box;
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 10px;
+    color: #f5f7fa;
+    padding: 14px;
+    font-size: 16px;
+    margin-bottom: 14px;
+  }
+  input[type="password"]:focus {
+    outline: none;
+    border-color: #ff6b6b;
+  }
+  .error {
+    color: #ef4444;
+    font-size: 14px;
+    margin-bottom: 12px;
+    line-height: 1.4;
+  }
+  .success {
+    color: #2ecc71;
+    font-size: 14px;
+    margin-bottom: 12px;
+    line-height: 1.4;
+  }
 </style>
 </head>
 <body>
-  <div class="card">
-    <div class="icon">✅</div>
-    <h1>All set</h1>
-    <p>This step is complete. Go back to the Unity Finance app to continue.</p>
-    <a class="button" id="openApp" href="unityfinance://">Open Unity Finance</a>
-    <p class="hint">If the app doesn't open automatically, switch back to it from your recent apps.</p>
+  <div class="card" id="root">
+    <div class="spinner" aria-hidden="true"></div>
+    <h1>Working…</h1>
+    <p>Please wait while we finish this step.</p>
   </div>
-  <script>
-    // Best-effort auto-open - most mobile browsers block a bare location
-    // change to a custom scheme without a user gesture, so the button above
-    // is the reliable path. This just saves a tap when it's allowed.
-    try { window.location.replace('unityfinance://'); } catch (e) {}
+
+  <script type="module">
+    /**
+     * Firebase Auth email-action landing page.
+     *
+     * Handles verifyEmail and resetPassword links from Firebase Auth emails.
+     * Set Authentication → Templates → Customize action URL to this Hosting
+     * domain (https://<project-id>.web.app).
+     */
+    import { initializeApp } from 'https://www.gstatic.com/firebasejs/11.6.0/firebase-app.js';
+    import {
+      getAuth,
+      applyActionCode,
+      confirmPasswordReset,
+      verifyPasswordResetCode,
+    } from 'https://www.gstatic.com/firebasejs/11.6.0/firebase-auth.js';
+
+    const params = new URLSearchParams(window.location.search);
+    const mode = params.get('mode');
+    const oobCode = params.get('oobCode');
+    const apiKey = params.get('apiKey');
+
+    const root = document.getElementById('root');
+
+    const render = ({ ok, title, message, showOpenApp = true, bodyHtml = '' }) => {
+      root.innerHTML = `
+        <div class="icon ${ok ? 'ok' : 'err'}">${ok ? '✅' : '✕'}</div>
+        <h1>${title}</h1>
+        <p>${message}</p>
+        ${bodyHtml}
+        ${showOpenApp ? '<a class="button" href="unityfinance://">Open Unity Finance</a>' : ''}
+        <p class="hint">You can close this page and return to the app.</p>
+      `;
+      if (showOpenApp) {
+        try { window.location.replace('unityfinance://'); } catch (e) {}
+      }
+    };
+
+    const renderWaiting = (title, message) => {
+      root.innerHTML = `
+        <div class="spinner" aria-hidden="true"></div>
+        <h1>${title}</h1>
+        <p>${message}</p>
+      `;
+    };
+
+    const isStrongPassword = (value) =>
+      /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z\d]).{8,}$/.test(value);
+
+    const renderResetPasswordForm = (auth, code) => {
+      root.innerHTML = `
+        <div class="icon wait">🔒</div>
+        <h1>Set a new password</h1>
+        <p>Choose a strong password for your Unity Finance account.</p>
+        <form class="form" id="resetForm">
+          <label for="password">New password</label>
+          <input id="password" type="password" autocomplete="new-password" required minlength="8" />
+          <label for="confirm">Confirm password</label>
+          <input id="confirm" type="password" autocomplete="new-password" required minlength="8" />
+          <div id="formError" class="error" style="display:none;"></div>
+          <div id="formSuccess" class="success" style="display:none;"></div>
+          <button class="button" type="submit" id="submitBtn">Update password</button>
+        </form>
+        <p class="hint">Prefer the app? <a href="unityfinance://reset-password?oobCode=${encodeURIComponent(code)}" style="color:#ff6b6b;">Open in Unity Finance</a></p>
+      `;
+
+      const form = document.getElementById('resetForm');
+      const passwordInput = document.getElementById('password');
+      const confirmInput = document.getElementById('confirm');
+      const formError = document.getElementById('formError');
+      const formSuccess = document.getElementById('formSuccess');
+      const submitBtn = document.getElementById('submitBtn');
+
+      form.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        formError.style.display = 'none';
+        formSuccess.style.display = 'none';
+
+        const password = passwordInput.value;
+        const confirm = confirmInput.value;
+
+        if (password !== confirm) {
+          formError.textContent = 'Passwords do not match.';
+          formError.style.display = 'block';
+          return;
+        }
+
+        if (!isStrongPassword(password)) {
+          formError.textContent =
+            'Password must be at least 8 characters and include uppercase, lowercase, number, and symbol.';
+          formError.style.display = 'block';
+          return;
+        }
+
+        submitBtn.disabled = true;
+        submitBtn.textContent = 'Updating…';
+
+        try {
+          await confirmPasswordReset(auth, code, password);
+          form.style.display = 'none';
+          render({
+            ok: true,
+            title: 'Password updated',
+            message: 'Your password has been changed. You can now sign in with your new password.',
+            showOpenApp: true,
+          });
+        } catch (err) {
+          submitBtn.disabled = false;
+          submitBtn.textContent = 'Update password';
+          const expired =
+            err && typeof err === 'object' &&
+            (err.code === 'auth/invalid-action-code' || err.code === 'auth/expired-action-code');
+          formError.textContent = expired
+            ? 'This reset link has expired. Request a new one from the app.'
+            : 'Could not update your password. Please try again or request a new reset link.';
+          formError.style.display = 'block';
+        }
+      });
+    };
+
+    if (!mode || !oobCode || !apiKey) {
+      render({
+        ok: false,
+        title: 'Invalid link',
+        message: 'This link is incomplete or expired. Open the app and request a new reset link.',
+        showOpenApp: true,
+      });
+    } else {
+      const app = initializeApp({ apiKey });
+      const auth = getAuth(app);
+
+      (async () => {
+        try {
+          if (mode === 'verifyEmail') {
+            renderWaiting('Verifying your email…', 'Just a moment.');
+            await applyActionCode(auth, oobCode);
+            render({
+              ok: true,
+              title: 'Email verified',
+              message: 'Your email address is confirmed. Return to Unity Finance — the app will continue automatically.',
+            });
+            return;
+          }
+
+          if (mode === 'resetPassword') {
+            renderWaiting('Checking reset link…', 'Just a moment.');
+            await verifyPasswordResetCode(auth, oobCode);
+            renderResetPasswordForm(auth, oobCode);
+            return;
+          }
+
+          if (mode === 'recoverEmail' || mode === 'verifyAndChangeEmail') {
+            renderWaiting('Confirming change…', 'Just a moment.');
+            await applyActionCode(auth, oobCode);
+            render({
+              ok: true,
+              title: 'Email updated',
+              message: 'Your email address change is confirmed. Return to the app to continue.',
+            });
+            return;
+          }
+
+          render({
+            ok: false,
+            title: 'Unsupported action',
+            message: 'This link type is not handled here. Please try again from the app.',
+          });
+        } catch (err) {
+          const code = err && typeof err === 'object' ? err.code : '';
+          const expired = code === 'auth/invalid-action-code' || code === 'auth/expired-action-code';
+          render({
+            ok: false,
+            title: expired ? 'Link expired' : 'Something went wrong',
+            message: expired
+              ? 'This link has already been used or has expired. Open the app and request a new reset link.'
+              : 'We could not complete this step. Please try again from the app.',
+          });
+        }
+      })();
+    }
   </script>
 </body>
 </html>

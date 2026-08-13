@@ -7,32 +7,15 @@
     "node": "20"
   },
   "main": "index.js",
-  "//scripts": [
-    "`test`      — Node's built-in runner. No emulator, no network. 77 pass, 17 skip.",
-    "`test:all`  — the SAME suite under the Firestore emulator. 94 pass, 0 skip.",
-    "The rules tests SKIP unless @firebase/rules-unit-testing is installed AND the",
-    "emulator is running; they never silently pass. Use `test:all` for the full run.",
-    "The emulator needs a JDK. If `java` is not on PATH, Android Studio ships one:",
-    "  export PATH=\"$JAVA_HOME/bin:$PATH\"   (JAVA_HOME e.g. E:/Android/AndroidSdk/jbr)",
-    "NOTE: every value under `scripts` must be a STRING. An array there is accepted",
-    "by `npm test` but makes `npm pkg set` fail with ESCRIPTSINVALID, which is why",
-    "this note lives at the top level instead."
-  ],
   "scripts": {
     "serve": "firebase emulators:start --only functions,firestore,auth,storage",
     "shell": "firebase functions:shell",
     "deploy": "firebase deploy --only functions",
-    "logs": "firebase functions:log",
-    "test": "node --test \"__tests__/**/*.test.js\"",
-    "test:rules": "firebase emulators:exec --only firestore --project unity-finance-rules-test \"node --test __tests__/firestore.rules.test.js\"",
-    "test:all": "firebase emulators:exec --only firestore --project unity-finance-rules-test \"node --test __tests__/**/*.test.js\""
+    "logs": "firebase functions:log"
   },
   "dependencies": {
     "firebase-admin": "^12.7.0",
-    "firebase-functions": "^6.1.1"
-  },
-  "devDependencies": {
-    "@firebase/rules-unit-testing": "^5.0.1",
-    "firebase": "^12.15.0"
+    "firebase-functions": "^6.1.1",
+    "otplib": "^13.4.1"
   }
 }

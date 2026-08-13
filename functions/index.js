@@ -53,6 +53,7 @@ const friends = require('./src/friends');
 const splits = require('./src/splits');
 const notifications = require('./src/notifications');
 const account = require('./src/account');
+const mfa = require('./src/mfa');
 const billing = require('./src/billing');
 const automations = require('./src/automations');
 const aiSmartAdd = require('./src/aiSmartAdd');
@@ -87,6 +88,7 @@ exports.deleteAccount = account.deleteAccount;
 exports.requestEmailChange = account.requestEmailChange;
 exports.confirmEmailChange = account.confirmEmailChange;
 exports.purgeTombstones = account.purgeTombstones;
+exports.mfaActions = mfa.mfaActions;
 
 // --- billing ----------------------------------------------------------------
 exports.verifyGooglePurchase = billing.verifyGooglePurchase;
