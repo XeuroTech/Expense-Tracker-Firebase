@@ -353,7 +353,19 @@ const updateBudgetsForTransaction = async (uid, type, categoryId, amount, date) 
 // Confirm-time actions — one per intent
 // ---------------------------------------------------------------------------
 
-const createTransaction = async (uid, action) => {
+/**
+ * Phase 4 (Part C/D, RC-4/RC-5) -- `transactionId` is now an explicit,
+ * DETERMINISTIC id passed in by `confirmPending` (derived from the pending
+ * action's own id), never Firestore's auto-generated `.doc()`. The atomicity
+ * this function already had via `db.runTransaction` is unchanged -- what was
+ * missing is idempotency ACROSS calls: without a deterministic id, a
+ * confirm-mutex recovery re-entering this function after a crash would create
+ * a SECOND transaction document. With one, `confirmPending`'s own recovery
+ * check can verify by existence whether this exact confirm already committed,
+ * and (belt and suspenders) a second literal execution of this function for
+ * the same id would `tx.set` the SAME document rather than a new one.
+ */
+const createTransaction = async (uid, action, options = {}) => {
     const type = action.transactionType;
     const amount = action.amount;
     const walletId = type === 'income'
@@ -372,13 +384,22 @@ const createTransaction = async (uid, action) => {
     const walletRef = userCollection(uid, COLL_WALLETS).doc(walletId);
     const destRef = type === 'transfer' ? userCollection(uid, COLL_WALLETS).doc(toWalletId) : null;
     const payeeRef = payeeId ? userCollection(uid, COLL_PAYEES).doc(payeeId) : null;
-    const txRef = userCollection(uid, COLL_TXS).doc();
+    const txRef = options.transactionId
+        ? userCollection(uid, COLL_TXS).doc(options.transactionId)
+        : userCollection(uid, COLL_TXS).doc();
 
     const date = action.date || new Date().toISOString();
     let note = action.note || action.merchant || null;
 
     await db.runTransaction(async (tx) => {
         // ---- READ PHASE ----
+        // Idempotent short-circuit: if the deterministic transaction doc
+        // already exists, a previous attempt already completed the write
+        // phase -- do nothing (no second debit/credit), same read-then-decide
+        // discipline every other handler in this codebase uses.
+        const existingTx = await tx.get(txRef);
+        if (existingTx.exists) return;
+
         const walletSnap = await tx.get(walletRef);
         if (!walletSnap.exists || walletSnap.data()._deletedAt) throw fail('AI_WALLET_NOT_FOUND', 404);
 
@@ -551,7 +572,14 @@ const createPayee = async (uid, action) => {
     return { result_type: 'payee', result_document_id: payee.$id, document: payee, action: resolved };
 };
 
-const createLoan = async (uid, action) => {
+/**
+ * Phase 4 (Part E, RC-4/RC-5) -- same deterministic-id/idempotent-replay
+ * treatment as `createTransaction`. Also fixes a real gap: this had NO
+ * insufficient-balance guard at all (unlike `createTransaction`), so
+ * `loan_given`/a debit-direction repayment could drive a wallet negative --
+ * same floor every other wallet debit in this codebase already enforces.
+ */
+const createLoan = async (uid, action, options = {}) => {
     if (action.loan?.type === 'repayment' && !(action.matches?.payeeId || action.payee?.id)) {
         throw fail('AI_MISSING_LOAN_PAYEE', 400);
     }
@@ -569,11 +597,16 @@ const createLoan = async (uid, action) => {
 
     const walletRef = userCollection(uid, COLL_WALLETS).doc(walletId);
     const payeeRef = userCollection(uid, COLL_PAYEES).doc(payee.$id);
-    const txRef = userCollection(uid, COLL_TXS).doc();
+    const txRef = options.transactionId
+        ? userCollection(uid, COLL_TXS).doc(options.transactionId)
+        : userCollection(uid, COLL_TXS).doc();
     const date = loan.date || withPayee.date || new Date().toISOString();
     const note = withPayee.note || `Loan ${loan.type} ${payee.name}`;
 
     await db.runTransaction(async (tx) => {
+        const existingTx = await tx.get(txRef);
+        if (existingTx.exists) return;
+
         const walletSnap = await tx.get(walletRef);
         if (!walletSnap.exists || walletSnap.data()._deletedAt) throw fail('AI_WALLET_NOT_FOUND', 404);
         const payeeSnap = await tx.get(payeeRef);
@@ -601,6 +634,13 @@ const createLoan = async (uid, action) => {
             }
         }
 
+        // Phase 4 fix: the missing floor. A bare balance write CANNOT
+        // express this refusal without a read-check first, which is exactly
+        // why this is inside the transaction's read phase, before any write.
+        if (walletDelta < 0 && applyBalanceDelta(walletBalance, walletDelta) < 0) {
+            throw fail('AI_INSUFFICIENT_BALANCE', 400);
+        }
+
         tx.set(txRef, {
             user_id: uid,
             amount,
@@ -624,7 +664,13 @@ const createLoan = async (uid, action) => {
     };
 };
 
-const createInvestment = async (uid, action) => {
+/**
+ * Phase 4 (Part F, RC-4/RC-5) -- same treatment as `createLoan`:
+ * deterministic id + idempotent replay, plus the same missing
+ * insufficient-balance floor for `invest_cap` (a wallet debit).
+ * `invest_prof` credits the wallet and needs no floor.
+ */
+const createInvestment = async (uid, action, options = {}) => {
     const { action: withPayee, payee } = await ensurePayeeForAction(uid, action, true);
     const investment = withPayee.investment || {};
     const amount = investment.profit || investment.amount;
@@ -635,13 +681,18 @@ const createInvestment = async (uid, action) => {
 
     const walletRef = userCollection(uid, COLL_WALLETS).doc(walletId);
     const payeeRef = userCollection(uid, COLL_PAYEES).doc(payee.$id);
-    const txRef = userCollection(uid, COLL_TXS).doc();
+    const txRef = options.transactionId
+        ? userCollection(uid, COLL_TXS).doc(options.transactionId)
+        : userCollection(uid, COLL_TXS).doc();
     const date = investment.date || withPayee.date || new Date().toISOString();
     const note = withPayee.note || (type === 'invest_prof'
         ? `Investment profit from ${payee.name}`
         : `Investment in ${payee.name}`);
 
     await db.runTransaction(async (tx) => {
+        const existingTx = await tx.get(txRef);
+        if (existingTx.exists) return;
+
         const walletSnap = await tx.get(walletRef);
         if (!walletSnap.exists || walletSnap.data()._deletedAt) throw fail('AI_WALLET_NOT_FOUND', 404);
         const payeeSnap = await tx.get(payeeRef);
@@ -649,6 +700,11 @@ const createInvestment = async (uid, action) => {
 
         const walletBalance = Number(walletSnap.data().current_balance) || 0;
         const walletDelta = type === 'invest_prof' ? amount : -amount;
+
+        // Phase 4 fix: the missing floor for invest_cap (a wallet debit).
+        if (walletDelta < 0 && applyBalanceDelta(walletBalance, walletDelta) < 0) {
+            throw fail('AI_INSUFFICIENT_BALANCE', 400);
+        }
 
         tx.set(txRef, {
             user_id: uid,

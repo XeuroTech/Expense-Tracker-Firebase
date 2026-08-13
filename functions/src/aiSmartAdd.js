@@ -55,9 +55,12 @@ const {
     withLogging,
     logEvent,
     assertRateLimit,
+    deterministicId,
+    withOperationMutex,
 } = require('./common');
 const {
     COLL_PENDING,
+    COLL_TXS,
     MODEL,
     GROQ_BASE_URL,
     INTENTS,
@@ -285,15 +288,34 @@ const sameName = (left, right) => {
     return !!normalizedLeft && normalizedLeft === normalizedRight;
 };
 
+/**
+ * Phase 4 (Part K, RC-7) -- previously: first exact-name match, else first
+ * SUBSTRING match in whatever order the wallet/category/payee list happened
+ * to be in, with no ranking. Two similarly-named records could silently
+ * resolve to whichever one came first -- unrelated to the user's intent.
+ *
+ * Now: an exact-name match still wins immediately (tie-broken deterministically
+ * by `$id`, not array order, in the rare case of an exact-name collision).
+ * Only when no exact match exists does substring matching run -- and if that
+ * finds more than one candidate, this returns `null` (ambiguous) rather than
+ * guessing. `null` flows into the same "missing/unresolved" path a true
+ * no-match already takes.
+ */
 const findNamed = (items, name) => {
     if (!name) return null;
     const wanted = name.trim().toLowerCase();
-    return items.find((item) => sameName(item.name, name))
-        || items.find((item) => {
-            const candidate = String(item.name || '').trim().toLowerCase();
-            return candidate.includes(wanted) || wanted.includes(candidate);
-        })
-        || null;
+
+    const exactMatches = items.filter((item) => sameName(item.name, name));
+    if (exactMatches.length === 1) return exactMatches[0];
+    if (exactMatches.length > 1) {
+        return [...exactMatches].sort((a, b) => String(a.$id).localeCompare(String(b.$id)))[0];
+    }
+
+    const fuzzyMatches = items.filter((item) => {
+        const candidate = String(item.name || '').trim().toLowerCase();
+        return candidate.includes(wanted) || wanted.includes(candidate);
+    });
+    return fuzzyMatches.length === 1 ? fuzzyMatches[0] : null;
 };
 
 const findExactNamed = (items, name) => {
@@ -305,6 +327,17 @@ const findById = (items, id) => {
     if (!id) return null;
     return items.find((item) => item.$id === id) || null;
 };
+
+/**
+ * Phase 4 (Part K, RC-7) -- when an id was already resolved (persisted on the
+ * pending action's `matches` at parse time, or supplied by the user editing
+ * the draft before confirm), that id is authoritative: look it up directly
+ * and either use it or fail. NEVER fall back to fuzzy name-matching for an id
+ * that no longer resolves -- that would silently substitute a DIFFERENT,
+ * similarly-named record for one the user already reviewed. Fuzzy-by-name
+ * only ever runs when no id was ever given.
+ */
+const resolveByIdOrName = (items, id, name) => (id ? findById(items, id) : findNamed(items, name));
 
 const addMissing = (set, field, isValid) => {
     if (!isValid) set.add(field);
@@ -512,8 +545,8 @@ const resolveAction = (action, wallets, categories, payees = []) => {
 
     const rawFromId = resolved.matches.fromWalletId || resolved.fromWalletId || null;
     const rawToId = resolved.matches.toWalletId || resolved.toWalletId || null;
-    const fromWallet = findById(wallets, rawFromId) || findNamed(wallets, resolved.fromWallet);
-    const toWallet = findById(wallets, rawToId) || findNamed(wallets, resolved.toWallet);
+    const fromWallet = resolveByIdOrName(wallets, rawFromId, resolved.fromWallet);
+    const toWallet = resolveByIdOrName(wallets, rawToId, resolved.toWallet);
 
     resolved.matches.fromWalletId = fromWallet ? fromWallet.$id : null;
     resolved.matches.toWalletId = toWallet ? toWallet.$id : null;
@@ -545,7 +578,7 @@ const resolveAction = (action, wallets, categories, payees = []) => {
 
     const rawPayeeId = resolved.matches.payeeId || resolved.payee?.id || null;
     const requestedPayeeName = resolved.payee?.name || resolved.loan?.personName || resolved.investment?.name;
-    const payee = findById(payees, rawPayeeId) || findNamed(payees, requestedPayeeName);
+    const payee = resolveByIdOrName(payees, rawPayeeId, requestedPayeeName);
     resolved.matches.payeeId = payee ? payee.$id : null;
     resolved.payee = {
         ...(resolved.payee || {}),
@@ -854,20 +887,92 @@ const cancelPending = async (uid, pendingActionId) => {
     await ref.set({ status: 'cancelled', ...touch() }, { merge: true });
 };
 
-const confirmPending = async (uid, body) => {
-    const pendingActionId = String(body.pendingActionId || '').trim();
-    if (!pendingActionId) throw fail('AI_PENDING_ACTION_NOT_FOUND', 404);
+// ---------------------------------------------------------------------------
+// Phase 4 (Part H/I/J, RC-5/RC-6) -- confirm idempotency.
+//
+// A `confirm:<pendingActionId>` operation mutex (reusing `withOperationMutex`
+// from common.js -- the SAME mechanism splits.js already relies on, Phase 3's
+// `recovery` option included) wraps the entire confirm sequence. At most one
+// financial execution can ever occur per pendingActionId:
+//
+//   - Mutex already `completed` -> replay its cached result verbatim. No
+//     financial write runs.
+//   - Mutex `recovered` (stale, the previous attempt crashed before marking
+//     itself completed) -> the ACTUAL pending-action state is read, never
+//     the mutex, to tell apart:
+//       (a) pending.status === 'confirmed' -> the whole sequence, including
+//           the financial write, already landed. Reconstruct the result from
+//           what was persisted.
+//       (b) pending.status === 'pending' AND the deterministic transaction
+//           document for this pendingActionId already exists -> the
+//           financial write landed (createTransaction/createLoan/
+//           createInvestment's own Firestore transaction committed) but the
+//           LAST step (marking the pending action confirmed) never did.
+//           Finish that step only -- no financial write runs again.
+//       (c) neither signal -> genuinely never got that far; safe to run the
+//           normal sequence.
+//   - Busy (fresh, non-stale, still processing) -> refused; a live call may
+//     still be running.
+//
+// `createTransaction`/`createLoan`/`createInvestment` are each given the SAME
+// deterministic transaction id (`smartadd_tx_<pendingActionId>`), which is
+// what makes (b) above verifiable, and is also their own independent
+// idempotent-replay key if this sequence is ever re-entered (each already
+// checks for that document's existence inside its own `db.runTransaction`).
+// ---------------------------------------------------------------------------
 
-    const ref = userCollection(uid, COLL_PENDING).doc(pendingActionId);
-    const snapshot = await ref.get();
-    if (!snapshot.exists) throw fail('AI_PENDING_ACTION_NOT_FOUND', 404);
+const RESULT_COLLECTION_BY_TYPE = {
+    transaction: COLL_TXS,
+    loan: COLL_TXS,
+    investment: COLL_TXS,
+    recurring_plan: undefined, // resolved dynamically below (needs COLL_PLANS etc.)
+};
 
-    const pending = snapshot.data();
+const buildConfirmResultFromPending = async (uid, pending) => {
+    const resultType = pending.result_type;
+    const documentId = pending.result_document_id;
+    if (!resultType || !documentId) return { result_type: resultType, result_document_id: documentId, document: null };
+
+    const collectionByType = {
+        transaction: COLL_TXS, loan: COLL_TXS, investment: COLL_TXS,
+        recurring_plan: COLL_PLANS, budget: COLL_BUDGETS, wallet: COLL_WALLETS,
+        category: COLL_CATEGORIES, payee: COLL_PAYEES,
+    };
+    const collectionName = collectionByType[resultType];
+    if (!collectionName) return { result_type: resultType, result_document_id: documentId, document: null };
+
+    const snapshot = await userCollection(uid, collectionName).doc(documentId).get();
+    const document = snapshot.exists ? { $id: snapshot.id, ...snapshot.data() } : null;
+    return { result_type: resultType, result_document_id: documentId, document };
+};
+
+const RESULT_TYPE_BY_TX_TYPE = {
+    expense: 'transaction', income: 'transaction', transfer: 'transaction',
+    loan_given: 'loan', loan_taken: 'loan', loan_repay: 'loan',
+    invest_cap: 'investment', invest_prof: 'investment',
+};
+
+const finalizeRecoveredFinancialConfirm = async (uid, pendingRef, existingTx) => {
+    const resultType = RESULT_TYPE_BY_TX_TYPE[existingTx.type] || 'transaction';
+    await pendingRef.set(
+        {
+            status: 'confirmed',
+            result_type: resultType,
+            result_document_id: existingTx.$id,
+            ...touch(),
+        },
+        { merge: true }
+    );
+    return { result_type: resultType, result_document_id: existingTx.$id, document: existingTx };
+};
+
+/** The normal (non-recovery) confirm sequence -- unchanged steps, plus the deterministic `transactionId`. */
+const runConfirmSequence = async (uid, pending, pendingRef, body, pendingActionId) => {
     if (pending.status !== 'pending') throw fail('AI_PENDING_ACTION_INACTIVE', 409);
 
     if (new Date(pending.expires_at).getTime() <= Date.now()) {
         await deleteProvisionalCategory(uid, JSON.parse(pending.action_json));
-        await ref.set({ status: 'expired', ...touch() }, { merge: true });
+        await pendingRef.set({ status: 'expired', ...touch() }, { merge: true });
         throw fail('AI_PENDING_ACTION_EXPIRED', 409);
     }
 
@@ -880,21 +985,23 @@ const confirmPending = async (uid, body) => {
         resolved = await ensureConfirmedCategory(uid, resolved);
     }
 
+    const transactionId = deterministicId('smartadd_tx', pendingActionId);
+
     let result;
-    if (resolved.intent === 'transaction') result = await createTransaction(uid, resolved);
+    if (resolved.intent === 'transaction') result = await createTransaction(uid, resolved, { transactionId });
     else if (resolved.intent === 'recurring_plan') result = await createRecurringPlan(uid, resolved);
     else if (resolved.intent === 'budget') result = await createOrUpdateBudget(uid, resolved);
     else if (resolved.intent === 'wallet_create') result = await createWallet(uid, resolved);
     else if (resolved.intent === 'category_create') result = await createCategoryAction(uid, resolved);
     else if (resolved.intent === 'payee_create') result = await createPayee(uid, resolved);
-    else if (resolved.intent === 'loan_create') result = await createLoan(uid, resolved);
-    else if (resolved.intent === 'investment_create') result = await createInvestment(uid, resolved);
+    else if (resolved.intent === 'loan_create') result = await createLoan(uid, resolved, { transactionId });
+    else if (resolved.intent === 'investment_create') result = await createInvestment(uid, resolved, { transactionId });
     else throw fail('AI_UNKNOWN_SMART_ACTION', 400);
 
     if (result.action) resolved = result.action;
 
     await cleanupUnusedProvisionalCategory(uid, pendingAction, resolved);
-    await ref.set(
+    await pendingRef.set(
         {
             status: 'confirmed',
             action_json: JSON.stringify(resolved),
@@ -906,6 +1013,40 @@ const confirmPending = async (uid, body) => {
     );
 
     return result;
+};
+
+const confirmPending = async (uid, body) => {
+    const pendingActionId = String(body.pendingActionId || '').trim();
+    if (!pendingActionId) throw fail('AI_PENDING_ACTION_NOT_FOUND', 404);
+
+    const pendingRef = userCollection(uid, COLL_PENDING).doc(pendingActionId);
+    const operationId = deterministicId('confirm', pendingActionId);
+
+    return withOperationMutex(operationId, 'AI_SMART_ADD_CONFIRM_IN_PROGRESS', async () => {
+        const snapshot = await pendingRef.get();
+        if (!snapshot.exists) throw fail('AI_PENDING_ACTION_NOT_FOUND', 404);
+        const pending = snapshot.data();
+
+        return runConfirmSequence(uid, pending, pendingRef, body, pendingActionId);
+    }, {
+        checkCompleted: async () => {
+            const snapshot = await pendingRef.get();
+            if (!snapshot.exists) return null;
+            const pending = snapshot.data();
+
+            if (pending.status === 'confirmed') {
+                return buildConfirmResultFromPending(uid, pending);
+            }
+            if (pending.status === 'pending') {
+                const transactionId = deterministicId('smartadd_tx', pendingActionId);
+                const txSnapshot = await userCollection(uid, COLL_TXS).doc(transactionId).get();
+                if (txSnapshot.exists) {
+                    return finalizeRecoveredFinancialConfirm(uid, pendingRef, { $id: txSnapshot.id, ...txSnapshot.data() });
+                }
+            }
+            return null;
+        },
+    });
 };
 
 const parsePrompt = async (uid, prompt, context = {}) => {
