@@ -5,7 +5,7 @@
  * `src/splits.js`. They do not rely on Appwrite's `split_operations.js` copies.
  *
  * Functional mutex behaviour (concurrent acquire, stale reclaim, completed replay)
- * requires the Firestore emulator — see the skipped block at the bottom, runnable via
+ * requires the Firestore emulator — see the block at the bottom, runnable via
  * `npm run test:all` when JDK + Firebase CLI are available.
  */
 
@@ -62,6 +62,17 @@ test('createSplitExpense wraps money path in withOperationMutex', () => {
     );
 });
 
+test('createSplitExpense supplies recovery.checkCompleted for post-crash reconciliation', () => {
+    const createBlock = splitsSource.slice(
+        splitsSource.indexOf("return withOperationMutex(operationId, 'SPLIT_CREATE_IN_PROGRESS'")
+    );
+    assert.match(
+        createBlock,
+        /checkCompleted:\s*async \(\) => replayCreateSplitByRequestId\(uid, requestId\)/,
+        'Split create must supply recovery.checkCompleted mirroring respond/settle.'
+    );
+});
+
 test('respondSplitRequest wraps money path in withOperationMutex with recovery', () => {
     assert.match(
         splitsSource,
@@ -103,6 +114,14 @@ test('respondSplitRequest pre-check idempotency before mutex (already answered)'
     );
 });
 
+test('respondSplitRequest in-transaction idempotent replay when no longer pending', () => {
+    assert.match(
+        splitsSource,
+        /alreadyAnswered:\s*true,\s*splitExpenseId:/,
+        'A concurrent retry must return the final split state instead of throwing 409.'
+    );
+});
+
 test('own_share accept debits member share_amount inside transaction', () => {
     assert.match(
         splitsSource,
@@ -117,4 +136,79 @@ test('own_share accept debits member share_amount inside transaction', () => {
 });
 
 // Functional suite — requires Firestore emulator (same pattern as rateLimiting.test.js)
-test('withOperationMutex functional behaviour (SKIPPED — no Firestore emulator)', { skip: true }, () => {});
+const EMULATOR_HOST = process.env.FIRESTORE_EMULATOR_HOST || '';
+
+if (!EMULATOR_HOST) {
+    test('withOperationMutex functional behaviour (SKIPPED — no Firestore emulator)', { skip: true }, () => {});
+} else {
+    process.env.GCLOUD_PROJECT = process.env.GCLOUD_PROJECT || 'unity-finance-mutex-test';
+    process.env.FIRESTORE_EMULATOR_HOST = EMULATOR_HOST;
+
+    const { withOperationMutex, db, stamps } = require('../src/common');
+
+    test('completed mutex replays stored JSON without re-running handler', async () => {
+        const operationId = `mutex-replay-${Date.now()}`;
+        const stored = { ok: true, value: 42 };
+        await db.collection('split_operations').doc(operationId).set({
+            status: 'completed',
+            result: JSON.stringify(stored),
+            ...stamps(),
+        });
+
+        let handlerRan = false;
+        const result = await withOperationMutex(operationId, 'BUSY', async () => {
+            handlerRan = true;
+            return { ok: false };
+        });
+
+        assert.deepStrictEqual(result, stored);
+        assert.strictEqual(handlerRan, false);
+    });
+
+    test('handler failure deletes mutex so a corrected retry can acquire', async () => {
+        const operationId = `mutex-fail-${Date.now()}`;
+
+        await assert.rejects(
+            () =>
+                withOperationMutex(operationId, 'BUSY', async () => {
+                    throw new Error('simulated failure');
+                }),
+            /simulated failure/
+        );
+
+        const snap = await db.collection('split_operations').doc(operationId).get();
+        assert.strictEqual(snap.exists, false);
+
+        const result = await withOperationMutex(operationId, 'BUSY', async () => ({ recovered: true }));
+        assert.deepStrictEqual(result, { recovered: true });
+    });
+
+    test('recovery.checkCompleted reconstructs result without re-running handler', async () => {
+        const operationId = `mutex-recover-${Date.now()}`;
+        await db.collection('split_operations').doc(operationId).set({
+            status: 'in_progress',
+            startedAt: new Date().toISOString(),
+            ...stamps(),
+        });
+
+        let handlerRan = false;
+        const result = await withOperationMutex(
+            operationId,
+            'BUSY',
+            async () => {
+                handlerRan = true;
+                return { should: 'not run' };
+            },
+            {
+                checkCompleted: async () => ({ reconstructed: true }),
+            }
+        );
+
+        assert.deepStrictEqual(result, { reconstructed: true });
+        assert.strictEqual(handlerRan, false);
+
+        const snap = await db.collection('split_operations').doc(operationId).get();
+        assert.strictEqual(snap.data().status, 'completed');
+        assert.strictEqual(JSON.parse(snap.data().result).reconstructed, true);
+    });
+}

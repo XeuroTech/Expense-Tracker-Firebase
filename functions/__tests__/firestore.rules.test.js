@@ -175,7 +175,7 @@ test('an unknown SUBCOLLECTION cannot be created', async (t) => {
     );
 });
 
-test('current_balance is create-only (CLOUD_CREATE_ONLY_ATTRIBUTES)', async (t) => {
+test('current_balance may be updated on wallet update (RC-1)', async (t) => {
     if (skipIfNoEmulator(t)) return;
 
     const { doc, setDoc, updateDoc, serverTimestamp } = require('firebase/firestore');
@@ -187,14 +187,19 @@ test('current_balance is create-only (CLOUD_CREATE_ONLY_ATTRIBUTES)', async (t) 
         });
     });
 
-    await testing.assertFails(
+    await testing.assertSucceeds(
         updateDoc(doc(alice(), `users/${ALICE}/wallets/w4`), {
-            current_balance: 999999,
+            current_balance: 75,
             _updatedAt: serverTimestamp(),
         })
     );
 
-    // A normal field on the same document still updates fine.
+    await testing.assertFails(
+        updateDoc(doc(alice(), `users/${ALICE}/wallets/w4`), {
+            current_balance: 50,
+        })
+    );
+
     await testing.assertSucceeds(
         updateDoc(doc(alice(), `users/${ALICE}/wallets/w4`), {
             name: 'Renamed',

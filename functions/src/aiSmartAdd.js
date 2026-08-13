@@ -1020,6 +1020,17 @@ const confirmPending = async (uid, body) => {
     if (!pendingActionId) throw fail('AI_PENDING_ACTION_NOT_FOUND', 404);
 
     const pendingRef = userCollection(uid, COLL_PENDING).doc(pendingActionId);
+
+    // Checked BEFORE the mutex, because a terminal pending action must not be
+    // re-confirmed — withOperationMutex would otherwise replay the completed
+    // mutex result and make a second call look successful. Timeout recovery
+    // while status is still 'pending' (financial write landed, confirm step
+    // not yet marked) is handled inside checkCompleted below; once status
+    // has left 'pending', the action is inactive by definition.
+    const preCheck = await pendingRef.get();
+    if (!preCheck.exists) throw fail('AI_PENDING_ACTION_NOT_FOUND', 404);
+    if (preCheck.data().status !== 'pending') throw fail('AI_PENDING_ACTION_INACTIVE', 409);
+
     const operationId = deterministicId('confirm', pendingActionId);
 
     return withOperationMutex(operationId, 'AI_SMART_ADD_CONFIRM_IN_PROGRESS', async () => {

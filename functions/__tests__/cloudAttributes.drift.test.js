@@ -226,18 +226,12 @@ test('every owner-scoped table in the rules is one the layout actually declares'
     assert.deepStrictEqual(sorted(Object.keys(rulesAttributes)), sorted(ownerScoped));
 });
 
-test('current_balance is create-only in both the adapter and the rules', () => {
-    const adapter = read('frontend/src/backend/firebase/cloudAttributes.ts');
-    const rules = read('firebase/firestore.rules');
+test('firestore.rules allows current_balance updates (RC-1 — createOnlyFields is empty)', () => {
+    const rules = read('Expense-Tracker-Firebase/firestore.rules');
 
     assert.match(
-        adapter,
-        /CLOUD_CREATE_ONLY_ATTRIBUTES[\s\S]{0,200}wallets:\s*\['current_balance'\]/,
-        'the adapter must keep wallets.current_balance create-only'
-    );
-    assert.match(
         rules,
-        /function createOnlyFields\(c\)[\s\S]{0,200}'current_balance'/,
-        'the rules must keep wallets.current_balance create-only'
+        /function createOnlyFields\(c\)\s*\{\s*return \[\];\s*\}/,
+        'rules must allow wallet current_balance updates — createOnlyFields returns empty'
     );
 });

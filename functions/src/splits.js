@@ -122,6 +122,33 @@ const loadProfiles = async (uids) => {
 // createSplitExpense
 // ---------------------------------------------------------------------------
 
+/**
+ * Idempotent replay for a completed split create — shared by the pre-mutex
+ * short-circuit, the in-mutex guard (stale reclaim protection), and mutex
+ * recovery.checkCompleted. Returns null unless the split AND its source
+ * transaction both exist (proof the money path committed).
+ */
+const replayCreateSplitByRequestId = async (uid, requestId) => {
+    const existing = await db
+        .collection('split_expenses')
+        .where('request_id', '==', requestId)
+        .where('created_by_user_id', '==', uid)
+        .limit(1)
+        .get();
+
+    if (existing.empty) return null;
+
+    const doc = existing.docs[0];
+    const data = doc.data();
+    const txnId = data.source_transaction_id;
+    if (txnId) {
+        const txnSnap = await db.collection('users').doc(uid).collection('transactions').doc(txnId).get();
+        if (!txnSnap.exists) return null;
+    }
+
+    return { success: true, splitExpense: { $id: doc.id, ...data } };
+};
+
 const createSplitExpenseHandler = async (request) => {
     const uid = requireAuth(request);
     // §16 — the money path. Cheapest guard first, before any read.
@@ -158,16 +185,8 @@ const createSplitExpenseHandler = async (request) => {
     // ── Idempotency layer 1: request_id ────────────────────────────────────────
     // Checked BEFORE the mutex, because a completed create must replay cheaply
     // without contending for a lock.
-    const existing = await db
-        .collection('split_expenses')
-        .where('request_id', '==', requestId)
-        .where('created_by_user_id', '==', uid)
-        .limit(1)
-        .get();
-
-    if (!existing.empty) {
-        return { success: true, splitExpense: { $id: existing.docs[0].id, ...existing.docs[0].data() } };
-    }
+    const existingReplay = await replayCreateSplitByRequestId(uid, requestId);
+    if (existingReplay) return existingReplay;
 
     // ── Idempotency layer 2: the server-side mutex (create(), never set()) ─────
     const operationId = deterministicId('split_create', uid, requestId);
@@ -182,6 +201,9 @@ const createSplitExpenseHandler = async (request) => {
         if (friendUids.includes(uid)) throw fail('INVALID_FRIEND', 400);
 
         await assertMutualFriends(uid, friendUids);
+
+        const mutexReplay = await replayCreateSplitByRequestId(uid, requestId);
+        if (mutexReplay) return mutexReplay;
 
         let shares;
         try {
@@ -323,6 +345,8 @@ const createSplitExpenseHandler = async (request) => {
 
         const created = await splitExpenseRef.get();
         return { success: true, splitExpense: { $id: created.id, ...created.data() } };
+    }, {
+        checkCompleted: async () => replayCreateSplitByRequestId(uid, requestId),
     });
 };
 
@@ -478,7 +502,7 @@ const respondSplitRequestHandler = async (request) => {
             // inside the transaction to close the narrow window between that read
             // and this one (e.g. a concurrent accept that commits in between).
             if (memberData.settlement_status !== 'pending') {
-                throw fail('SPLIT_ALREADY_SETTLED', 409);
+                return { alreadyAnswered: true, splitExpenseId: memberData.split_expense_id };
             }
 
             const splitRef = db.collection('split_expenses').doc(memberData.split_expense_id);
@@ -1095,4 +1119,11 @@ const listSplitRequests = async (uid, data) => {
     };
 };
 
-module.exports = { createSplitExpense, respondSplitRequest, settleSplitPayment };
+module.exports = {
+    createSplitExpense,
+    respondSplitRequest,
+    settleSplitPayment,
+    createSplitExpenseHandler,
+    respondSplitRequestHandler,
+    settleSplitPaymentHandler,
+};
