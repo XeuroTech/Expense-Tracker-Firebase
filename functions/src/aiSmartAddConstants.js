@@ -23,7 +23,11 @@ module.exports = {
     COLL_BUDGETS: 'budgets',
     COLL_BUDGET_PERIODS: 'budget_periods',
     COLL_PENDING: 'ai_pending_actions',
-    MODEL: process.env.GROQ_MODEL || 'llama-3.3-70b-versatile',
+    // llama-3.3-70b-versatile was deprecated/shut down by Groq on 2026-08-16 —
+    // every call to it now fails, which surfaced to users as AI_SERVICE_REQUEST_FAILED.
+    // openai/gpt-oss-120b is Groq's recommended replacement (supports the same
+    // response_format: 'json_object' this callable relies on).
+    MODEL: process.env.GROQ_MODEL || 'openai/gpt-oss-120b',
     GROQ_BASE_URL: process.env.GROQ_BASE_URL || 'https://api.groq.com/openai/v1',
     PENDING_TTL_MS: 30 * 60 * 1000,
     DUPLICATE_WINDOW_MS: 5 * 60 * 1000,
