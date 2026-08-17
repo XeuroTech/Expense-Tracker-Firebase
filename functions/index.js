@@ -41,6 +41,19 @@
  *     Replaced by the platform: `sendEmailVerification()` and
  *     `sendPasswordResetEmail()` / `confirmPasswordReset()`.
  *
+ * `confirmEmailChange` — REMOVED, not merely deferred.
+ *     `requestEmailChange` (src/account.js) now only validates + rate-limits;
+ *     it sends nothing. The client calls the platform's own
+ *     `verifyBeforeUpdateEmail()` right after — that is Firebase's official
+ *     function for this, and the only one that both generates the action link
+ *     AND sends Firebase's templated email (the Admin SDK's
+ *     `generateVerifyAndChangeEmailLink` can only produce the link string, it
+ *     never sends mail, so it is not used here). The platform applies the
+ *     change itself when the link is opened (`hosting/index.html`,
+ *     mode=verifyAndChangeEmail) — there is no code to confirm anymore. The
+ *     client must call `syncMyProfile` after returning from the link so
+ *     `users/{uid}.email` picks up the change.
+ *
  * `aiSmartAdd` — NOW PORTED.
  *     See src/aiSmartAdd.js + src/aiSmartAddActions.js. Requires the `GROQ_API_KEY`
  *     secret to be set (`firebase functions:secrets:set GROQ_API_KEY`) before the
@@ -86,7 +99,6 @@ exports.registerDeviceToken = notifications.registerDeviceToken;
 // --- account ----------------------------------------------------------------
 exports.deleteAccount = account.deleteAccount;
 exports.requestEmailChange = account.requestEmailChange;
-exports.confirmEmailChange = account.confirmEmailChange;
 exports.purgeTombstones = account.purgeTombstones;
 exports.mfaActions = mfa.mfaActions;
 

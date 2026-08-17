@@ -1,8 +1,6 @@
 /**
- * Account lifecycle: deletion and the email-change OTP flow.
+ * Account lifecycle: deletion and the email-change link flow.
  */
-
-const crypto = require('crypto');
 
 const { onCall } = require('firebase-functions/v2/https');
 const { onSchedule } = require('firebase-functions/v2/scheduler');
@@ -11,23 +9,13 @@ const {
     auth,
     db,
     FieldValue,
-    Timestamp,
     fail,
     requireAuth,
-    sha256,
-    deterministicId,
-    stamps,
     touch,
     DELETED_AT,
     assertRateLimit,
     withLogging,
 } = require('./common');
-
-const {
-    sendOtpEmail,
-    RESEND_API_KEY,
-    RESEND_FROM,
-} = require('./email');
 
 // NOTE: process.env.FIREBASE_REGION can never actually be set via .env -- Cloud
 // Functions rejects any .env key with the FIREBASE_ prefix as reserved. This
@@ -37,7 +25,6 @@ const REGION = process.env.FIREBASE_REGION || 'me-central1';
 
 // Mirrors the Appwrite `delete_account` function tuning constants.
 const DUPLICATE_GUARD_MS = 2 * 60 * 1000;
-const OTP_TTL_MS = 5 * 60 * 1000;
 
 const DELETION_STATE_COLLECTION = 'account_deletion_state';
 
@@ -161,23 +148,37 @@ const deleteAccount = onCall(
 );
 
 /**
- * Issues an email-change OTP.
+ * Validates and rate-limits an email-change request. Sends nothing itself.
  *
- * ── TWO THINGS TO NOTE ──────────────────────────────────────────────────────────
+ * ── THINGS TO NOTE ──────────────────────────────────────────────────────────────
  *
  * 1. The uid comes from `request.auth`, NEVER from the body. The Appwrite
  *    `email-change-handler` trusts `userId` from the request body, which lets any
  *    caller change any user's email. That defect is not reproducible in a callable —
  *    there is no body field to trust.
  *
- * 2. OTP delivery uses Resend (`sendOtpEmail`). Configure RESEND_API_KEY and
- *    RESEND_FROM in Secret Manager before deploy.
+ * 2. The Admin SDK (`generateVerifyAndChangeEmailLink`) can only generate the
+ *    action-link string — it never sends mail. Firebase's OWN official email for
+ *    this flow only exists on the client SDK, via `verifyBeforeUpdateEmail()`,
+ *    which generates the link AND sends Firebase's templated email in one call.
+ *    So once this callable returns `{ success: true }`, the client must call:
+ *
+ *        await verifyBeforeUpdateEmail(auth.currentUser, newEmail)
+ *
+ *    itself — this callable only front-loads the checks (rate limit, duplicate
+ *    email) so the client gets a clean error before Firebase ever sends mail.
+ *
+ * 3. Clicking the resulting link hits `hosting/index.html` (mode=verifyAndChangeEmail),
+ *    which calls `applyActionCode` and the platform swaps the account's email
+ *    itself. The client should then call `syncMyProfile` so `users/{uid}.email`
+ *    picks up the change — Firebase Auth does not fire a Cloud Function trigger on
+ *    user update. Customize the email's look and the link's destination under
+ *    Firebase Console → Authentication → Templates → "Email address change".
  */
 const requestEmailChange = onCall(
     {
         region: REGION,
         maxInstances: 10,
-        secrets: [RESEND_API_KEY, RESEND_FROM],
     },
     async (request) => {
     const uid = requireAuth(request);
@@ -193,69 +194,9 @@ const requestEmailChange = onCall(
     const existing = await auth.getUserByEmail(email).catch(() => null);
     if (existing && existing.uid !== uid) throw fail('EMAIL_ALREADY_IN_USE', 409);
 
-    const code = String(crypto.randomInt(100000, 1000000));
-    const challengeId = deterministicId('otp', uid, email);
-
-    await db.collection('otp_challenges').doc(challengeId).set({
-        user_id: uid,
-        email,
-        code_hash: sha256(`${challengeId}:${code}`),
-        attempts: 0,
-        expires_at: Timestamp.fromMillis(Date.now() + OTP_TTL_MS),
-        ...stamps(),
-    });
-
-    await sendOtpEmail({
-        to: email,
-        purpose: 'email_change',
-        code,
-        expiresMinutes: OTP_TTL_MS / 60000,
-    });
-
-    return {
-        success: true,
-        challengeId,
-        maskedEmail: maskEmail(email),
-        expiresInSeconds: OTP_TTL_MS / 1000,
-    };
+    return { success: true, maskedEmail: maskEmail(email) };
     }
 );
-
-const confirmEmailChange = onCall({ region: REGION, maxInstances: 10 }, async (request) => {
-    const uid = requireAuth(request);
-    const challengeId = String((request.data && request.data.challengeId) || '').trim();
-    const code = String((request.data && request.data.code) || '').trim();
-
-    if (!challengeId || !code) throw fail('INVALID_OTP', 400);
-
-    const ref = db.collection('otp_challenges').doc(challengeId);
-
-    const email = await db.runTransaction(async (tx) => {
-        const snapshot = await tx.get(ref);
-        if (!snapshot.exists) throw fail('OTP_NOT_FOUND', 404);
-
-        const data = snapshot.data();
-        if (data.user_id !== uid) throw fail('OTP_NOT_FOUND', 404);
-        if (data.expires_at.toMillis() < Date.now()) throw fail('OTP_EXPIRED', 400);
-
-        // Bounded attempts — otherwise a 6-digit code is brute-forceable in seconds.
-        if ((data.attempts || 0) >= 5) throw fail('OTP_TOO_MANY_ATTEMPTS', 429);
-
-        const expected = sha256(`${challengeId}:${code}`);
-        if (expected !== data.code_hash) {
-            tx.update(ref, { attempts: (data.attempts || 0) + 1, ...touch() });
-            throw fail('INVALID_OTP', 400);
-        }
-
-        tx.delete(ref);
-        return data.email;
-    });
-
-    await auth.updateUser(uid, { email, emailVerified: false });
-    await db.collection('users').doc(uid).set({ email, ...touch() }, { merge: true });
-
-    return { success: true };
-});
 
 /**
  * Bounded tombstone lifetime.
@@ -287,4 +228,4 @@ const purgeTombstones = onSchedule(
     }
 );
 
-module.exports = { deleteAccount, requestEmailChange, confirmEmailChange, purgeTombstones };
+module.exports = { deleteAccount, requestEmailChange, purgeTombstones };

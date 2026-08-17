@@ -20,14 +20,12 @@ const RESEND_FROM = defineSecret('RESEND_FROM');
 const RESEND_API_URL = 'https://api.resend.com/emails';
 
 const OTP_SUBJECTS = {
-    email_change: 'Your Expense Tracker email change code',
     mfa_login: 'Your Expense Tracker sign-in verification code',
     mfa_security: 'Your Expense Tracker two-factor verification code',
 };
 
 const buildOtpText = (purpose, code, expiresMinutes) => {
     const introByPurpose = {
-        email_change: 'You requested to change the email on your Expense Tracker account.',
         mfa_login: 'Someone is signing in to your Expense Tracker account.',
         mfa_security: 'You requested a security verification for your Expense Tracker account.',
     };
@@ -43,7 +41,6 @@ const buildOtpText = (purpose, code, expiresMinutes) => {
 
 const buildOtpHtml = (purpose, code, expiresMinutes) => {
     const titleByPurpose = {
-        email_change: 'Email change verification',
         mfa_login: 'Sign-in verification',
         mfa_security: 'Two-factor verification',
     };

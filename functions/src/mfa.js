@@ -35,7 +35,17 @@ const MFA_USE_TOTP = process.env.MFA_USE_TOTP === 'true';
 const TOTP_ISSUER = process.env.MFA_TOTP_ISSUER || 'Expense Tracker';
 const TOTP_SETUP_TTL_MS = 10 * 60 * 1000;
 
-const TOTP_EPOCH_TOLERANCE = 1;
+/**
+ * `otplib`'s `epochTolerance` is a window in SECONDS, not a count of 30-second
+ * steps (unlike e.g. speakeasy's `window`) — verified directly against the
+ * installed otplib@13 typings/docs. `1` here would mean "tolerate 1 SECOND of
+ * drift", i.e. effectively none: any code typed more than a second after it
+ * was read, or a phone/server clock a few seconds apart, would be rejected as
+ * invalid even though it's a genuine Google Authenticator code. `30` matches
+ * otplib's own documented "Standard (most 2FA implementations)" value — one
+ * full step of symmetric tolerance either side of the current time.
+ */
+const TOTP_EPOCH_TOLERANCE = 30;
 
 const MFA_STATE_COLLECTION = 'mfa_state';
 const MFA_CHALLENGES_COLLECTION = 'mfa_challenges';
@@ -90,7 +100,8 @@ const isTotpEnabledForUser = async (uid) => {
 const verifyTotpToken = (secret, token) => {
     const trimmed = String(token || '').trim();
     if (!/^\d{6}$/.test(trimmed)) return false;
-    return verifySync({ token: trimmed, secret: String(secret || ''), epochTolerance: TOTP_EPOCH_TOLERANCE });
+    const result = verifySync({ token: trimmed, secret: String(secret || ''), epochTolerance: TOTP_EPOCH_TOLERANCE });
+    return !!result?.valid;
 };
 
 const handleSetupTotp = async (uid) => {
