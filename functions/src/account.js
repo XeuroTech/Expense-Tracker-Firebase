@@ -9,6 +9,7 @@ const {
     auth,
     db,
     FieldValue,
+    Timestamp,
     fail,
     requireAuth,
     touch,
