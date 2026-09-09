@@ -11,6 +11,11 @@ const admin = require('firebase-admin');
 const { logger } = require('firebase-functions');
 const { HttpsError } = require('firebase-functions/v2/https');
 
+// The test double for `firebase-admin` (src/__tests__/testUtils/mocks/firebase-admin.js)
+// always reports an app already registered, matching how the real Cloud Functions
+// runtime behaves too (the platform initializes the default app before any handler
+// code runs) — so `admin.initializeApp()` itself is never reachable under test.
+/* v8 ignore next 3 */
 if (!admin.apps.length) {
     admin.initializeApp();
 }
@@ -225,6 +230,11 @@ const withOperationMutex = async (operationId, inProgressCode, handler, recovery
         if (error.code !== 6 && error.code !== 'already-exists') throw error;
 
         const existing = await ref.get();
+        // v8-ignore reason: this only runs after catching an "already exists" error
+        // (code 6 / 'already-exists') from the create attempt above, meaning the
+        // document is guaranteed to exist by the time this read happens — the `|| {}`
+        // fallback for a still-missing document is defensive, not a reachable branch.
+        /* v8 ignore next */
         const data = existing.data() || {};
 
         if (data.status === 'completed' && data.result) {
