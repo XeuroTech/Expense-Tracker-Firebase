@@ -1,0 +1,19 @@
+[debug] [2026-09-16T09:40:56.008Z] ----------------------------------------------------------------------
+[debug] [2026-09-16T09:40:56.012Z] Command:       /usr/bin/node /sessions/rcw-016ckupsecyt89pzn1erahs6/.npm-global/bin/firebase login --no-localhost
+[debug] [2026-09-16T09:40:56.013Z] CLI Version:   15.30.1
+[debug] [2026-09-16T09:40:56.013Z] Platform:      linux
+[debug] [2026-09-16T09:40:56.013Z] Node Version:  v22.23.2
+[debug] [2026-09-16T09:40:56.013Z] Detected Agent: unknown
+[debug] [2026-09-16T09:40:56.014Z] Time:          Wed Sep 16 2026 09:40:56 GMT+0000 (Coordinated Universal Time)
+[debug] [2026-09-16T09:40:56.014Z] ----------------------------------------------------------------------
+[debug] 
+[debug] [2026-09-16T09:40:56.041Z] >>> [apiv2][query] GET https://firebase-public.firebaseio.com/cli.json [none]
+[debug] [2026-09-16T09:40:56.645Z] Object "" in "firebase.json" has unknown property: {"additionalProperty":"//"}
+[debug] [2026-09-16T09:40:56.670Z] >>> [apiv2][query] POST https://auth.firebase.tools/attest [none]
+[debug] [2026-09-16T09:40:56.673Z] >>> [apiv2][body] POST https://auth.firebase.tools/attest {"session_id":"b928c911-2294-4839-a501-9dcc01159805"}
+[debug] [2026-09-16T09:40:56.741Z] *** [apiv2] error from fetch(https://firebase-public.firebaseio.com/cli.json, {"headers":{},"method":"GET","dispatcher":{"_events":{},"_eventsCount":0}}): Error: Request was cancelled.
+[warn] ⚠  Unable to fetch the CLI MOTD and remote config. This is not a fatal error, but may indicate an issue with your network connection. 
+[debug] [2026-09-16T09:40:56.744Z] Failed to fetch MOTD FirebaseError: Failed to make request to https://firebase-public.firebaseio.com/cli.json
+[debug] [2026-09-16T09:40:56.748Z] *** [apiv2] error from fetch(https://auth.firebase.tools/attest, {"headers":{},"method":"POST","dispatcher":{"_events":{},"_eventsCount":0},"body":"{\"session_id\":\"b928c911-2294-4839-a501-9dcc01159805\"}"}): Error: Request was cancelled.
+[error] 
+[error] Error: Failed to start login: Failed to make request to https://auth.firebase.tools/attest

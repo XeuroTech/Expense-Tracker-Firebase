@@ -43,7 +43,7 @@ const ANDROID_PACKAGE_NAME = 'com.xeurotech.aiexpense';
 // It must be authorized in Play Console (Users and permissions) exactly like a
 // human user would be, with the same Play Developer API account permissions.
 const ANDROID_PUBLISHER_SERVICE_ACCOUNT = 'unity-finance-play-api@expense-tracker-b8db9.iam.gserviceaccount.com';
-const ANDROID_BASE_PLAN_TO_CYCLE = { monthly: 'monthly', yearly: 'yearly' };
+const ANDROID_BASE_PLAN_TO_CYCLE = { 'unity-pro-monthly': 'monthly', 'unity-pro-yearly': 'yearly' };
 // A subscription still counts as usable Pro in these states as long as its
 // expiry time is still in the future — e.g. SUBSCRIPTION_STATE_CANCELED means
 // auto-renew is off, but the user already paid through `expiryTime`.
