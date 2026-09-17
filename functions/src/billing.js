@@ -26,7 +26,7 @@
  * free-Pro exploit.
  */
 
-const { onCall, onRequest } = require('firebase-functions/v2/https');
+const { onCall, onRequest, HttpsError } = require('firebase-functions/v2/https');
 const { onMessagePublished } = require('firebase-functions/v2/pubsub');
 const { logger } = require('firebase-functions');
 const { google } = require('googleapis');
@@ -189,38 +189,47 @@ const fetchAndAcknowledgeSubscription = async (purchaseToken) => {
 };
 
 const verifyGooglePurchase = onCall({ region: REGION, maxInstances: 10, serviceAccount: ANDROID_PUBLISHER_SERVICE_ACCOUNT }, async (request) => {
-    const uid = requireAuth(request);
-    // §16 — receipt verification calls a paid external API once credentials land;
-    // bound it now rather than after that becomes a real per-call cost.
-    await assertRateLimit(uid, 'verifyGooglePurchase', { max: 10, windowMs: 60 * 60 * 1000 });
-    const purchaseToken = String((request.data && request.data.purchaseToken) || '').trim();
-    const productId = String((request.data && request.data.productId) || '').trim();
+    try {
+        const uid = requireAuth(request);
+        // §16 — receipt verification calls a paid external API once credentials land;
+        // bound it now rather than after that becomes a real per-call cost.
+        await assertRateLimit(uid, 'verifyGooglePurchase', { max: 10, windowMs: 60 * 60 * 1000 });
+        const purchaseToken = String((request.data && request.data.purchaseToken) || '').trim();
+        const productId = String((request.data && request.data.productId) || '').trim();
 
-    if (!purchaseToken || !productId) throw fail('INVALID_PURCHASE', 400);
+        if (!purchaseToken || !productId) throw fail('INVALID_PURCHASE', 400);
 
-    if (!(await claimPurchaseToken(purchaseToken, uid))) {
-        throw fail('PURCHASE_ALREADY_CLAIMED', 409);
+        if (!(await claimPurchaseToken(purchaseToken, uid))) {
+            throw fail('PURCHASE_ALREADY_CLAIMED', 409);
+        }
+
+        const verified = await fetchAndAcknowledgeSubscription(purchaseToken);
+
+        // Defence in depth: `obfuscatedAccountId` is set by the client at purchase
+        // time (frontend `buySubscription`) and echoed back by Play here. A token
+        // that was never claimed yet but belongs to a different account (e.g. a
+        // restore attempted on the wrong account) is rejected rather than granted.
+        if (verified.obfuscatedAccountId && verified.obfuscatedAccountId !== uid) {
+            throw fail('PURCHASE_ALREADY_CLAIMED', 409);
+        }
+
+        const subscription = await grantEntitlement(uid, {
+            productId: verified.productId,
+            platform: 'android',
+            expiresAt: verified.expiresAt,
+            billingCycle: verified.billingCycle,
+            status: verified.status,
+        });
+
+        return { success: true, subscription };
+    } catch (error) {
+        if (error instanceof HttpsError) throw error;
+        // [iap-debug] Temporary: surface the real exception message to the client
+        // instead of the generic "INTERNAL" the Functions runtime substitutes for
+        // any non-HttpsError throw. Remove once the root cause is confirmed.
+        logger.error('[iap-debug] verifyGooglePurchase unhandled error', error);
+        throw fail(`INTERNAL_DEBUG: ${(error && error.message) || String(error)}`, 500);
     }
-
-    const verified = await fetchAndAcknowledgeSubscription(purchaseToken);
-
-    // Defence in depth: `obfuscatedAccountId` is set by the client at purchase
-    // time (frontend `buySubscription`) and echoed back by Play here. A token
-    // that was never claimed yet but belongs to a different account (e.g. a
-    // restore attempted on the wrong account) is rejected rather than granted.
-    if (verified.obfuscatedAccountId && verified.obfuscatedAccountId !== uid) {
-        throw fail('PURCHASE_ALREADY_CLAIMED', 409);
-    }
-
-    const subscription = await grantEntitlement(uid, {
-        productId: verified.productId,
-        platform: 'android',
-        expiresAt: verified.expiresAt,
-        billingCycle: verified.billingCycle,
-        status: verified.status,
-    });
-
-    return { success: true, subscription };
 });
 
 const verifyApplePurchase = onCall({ region: REGION, maxInstances: 10 }, async (request) => {
