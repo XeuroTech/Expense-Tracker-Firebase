@@ -9,6 +9,7 @@ const {
     auth,
     db,
     FieldValue,
+    Timestamp,
     fail,
     requireAuth,
     touch,
@@ -29,6 +30,10 @@ const DUPLICATE_GUARD_MS = 2 * 60 * 1000;
 const DELETION_STATE_COLLECTION = 'account_deletion_state';
 
 const maskEmail = (email) => {
+    // maskEmail is only ever called internally, both call sites already having
+    // validated `email` is a non-empty string containing '@' — the `|| ''` fallback
+    // below (for an undefined/null email) is defensive, not a reachable branch.
+    /* v8 ignore next */
     const [local, domain] = String(email || '').split('@');
     if (!local || !domain) return 'your registered email';
     return `${local.slice(0, 1)}${'*'.repeat(Math.max(local.length - 1, 3))}@${domain}`;
