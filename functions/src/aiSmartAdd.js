@@ -671,6 +671,8 @@ const buildPrompt = (prompt, wallets, categories, payees = [], budgets = [], rec
                 'Category-only prompts must use category_create and must not ask for amount, wallet, transactionType, or date.',
                 'Never invent wallet IDs or category IDs.',
                 'Never invent payee IDs. Choose wallet/category/payee IDs only from the provided lists.',
+                'When a loan, investment, or payee_create prompt names a person or business that matches an existing payee, set payee.id to that payee\'s id from the provided list and set payee.name, loan.personName, and investment.name to that payee\'s actual name string.',
+                'Never write a payee id (or any wallet/category id) into payee.name, loan.personName, or investment.name. Those fields must always hold a human-readable display name, never an id.',
                 'Match wallet, category, and payee names case-insensitively.',
                 'If a required existing ID is not in the provided lists, set that ID to null.',
                 'If a transaction or budget category does not exist and the category name is clear, set categoryId null and set pendingCategoryToCreate with the category name and correct type.',
