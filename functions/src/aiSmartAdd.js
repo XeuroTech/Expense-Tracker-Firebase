@@ -9,9 +9,18 @@
  * ── STRUCTURE MIRRORS THE SOURCE ────────────────────────────────────────────────
  * Appwrite splits this across constants.js / validation.js / actions.js / main.js.
  * This port keeps the same split — aiSmartAddConstants.js / aiSmartAdd.js (this
- * file: normalization, resolution, the Groq call, orchestration) /
- * aiSmartAddActions.js (confirm-time writes) — specifically so the two
- * implementations stay comparable side by side.
+ * file: normalization, resolution, the AI model call, orchestration) /
+ * aiSmartAddActions.js (confirm-time writes) / openRouterService.js (the model
+ * HTTP client, framework-agnostic) — specifically so the two implementations
+ * stay comparable side by side.
+ *
+ * ── MODEL PROVIDER ───────────────────────────────────────────────────────────────
+ * Originally called Groq directly. Now calls OpenRouter (openRouterService.js)
+ * instead — same request shape (buildPrompt below is untouched), same JSON
+ * contract, same domain error codes. `OPEN_ROUTER_KEY` is a plain functions/.env
+ * value (auto-loaded by Firebase Functions v2), not a Secret Manager secret —
+ * unlike the old `GROQ_API_KEY`, which was a bound secret because it was set up
+ * before this project settled on keeping AI keys in `.env`.
  *
  * ── WHAT IS A DIRECT PORT VS WHAT CHANGED ────────────────────────────────────────
  * `normalizeAiAction`, `resolveAction`, `recomputeMissingFields`, `applyDefaults`
@@ -43,8 +52,8 @@
  */
 
 const { onCall } = require('firebase-functions/v2/https');
-const { defineSecret } = require('firebase-functions/params');
 
+const { callOpenRouter, OpenRouterServiceError } = require('./openRouterService');
 const {
     fail,
     requireAuth,
@@ -61,8 +70,6 @@ const {
 const {
     COLL_PENDING,
     COLL_TXS,
-    MODEL,
-    GROQ_BASE_URL,
     INTENTS,
     TRANSACTION_TYPES,
     FREQUENCIES,
@@ -98,14 +105,6 @@ const {
 // fallback IS the real, only config. me-central1 matches the live Firestore
 // database's location exactly -- do not change without recreating the project.
 const REGION = process.env.FIREBASE_REGION || 'me-central1';
-
-/**
- * Set once via `firebase functions:secrets:set GROQ_API_KEY --project <id>` before
- * deploy. Deliberately a Secret Manager secret, not a `.env` value or a plain
- * `process.env` read (unlike `TRANSACTIONAL_EMAIL_API_KEY` in account.js) — this
- * key can place real, billed calls to a third-party API on every parse.
- */
-const GROQ_API_KEY = defineSecret('GROQ_API_KEY');
 
 // ---------------------------------------------------------------------------
 // Normalization — verbatim from validation.js
@@ -643,7 +642,7 @@ const resolveAction = (action, wallets, categories, payees = []) => {
 };
 
 // ---------------------------------------------------------------------------
-// Groq call — buildPrompt is verbatim from validation.js
+// AI model call (OpenRouter) — buildPrompt is verbatim from validation.js
 // ---------------------------------------------------------------------------
 
 const buildPrompt = (prompt, wallets, categories, payees = [], budgets = [], recurringPlans = [], context = {}) => {
@@ -808,44 +807,43 @@ const buildPrompt = (prompt, wallets, categories, payees = [], budgets = [], rec
     ];
 };
 
-const callGroq = async (prompt, wallets, categories, payees, budgets, recurringPlans, context) => {
-    const apiKey = GROQ_API_KEY.value();
-    if (!apiKey) throw fail('AI_SERVICE_NOT_CONFIGURED', 500);
+// Maps openRouterService's provider-agnostic error codes onto this callable's
+// existing domain codes — the client-visible contract is unchanged from Groq.
+const OPENROUTER_ERROR_TO_DOMAIN_CODE = {
+    NOT_CONFIGURED: 'AI_SERVICE_NOT_CONFIGURED',
+    AUTH_FAILED: 'AI_SERVICE_REQUEST_FAILED',
+    RATE_LIMITED: 'AI_SERVICE_REQUEST_FAILED',
+    REQUEST_FAILED: 'AI_SERVICE_REQUEST_FAILED',
+    INVALID_RESPONSE: 'AI_SERVICE_INVALID_RESPONSE',
+    EMPTY_RESPONSE: 'AI_SERVICE_INVALID_RESPONSE',
+};
 
-    let response;
+const callAiModel = async (prompt, wallets, categories, payees, budgets, recurringPlans, context) => {
+    let result;
     try {
-        response = await fetch(`${GROQ_BASE_URL}/chat/completions`, {
-            method: 'POST',
-            headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                model: MODEL,
-                messages: buildPrompt(prompt, wallets, categories, payees, budgets, recurringPlans, context),
-                temperature: 0.1,
-                response_format: { type: 'json_object' },
-            }),
+        result = await callOpenRouter({
+            messages: buildPrompt(prompt, wallets, categories, payees, budgets, recurringPlans, context),
+            temperature: 0.1,
+            responseFormat: { type: 'json_object' },
         });
     } catch (err) {
-        // Logged server-side only — the client still gets the generic domain code.
-        logEvent('aiSmartAdd.callGroq', 'failure', { reason: 'fetch_threw', errorMessage: err && err.message, errorName: err && err.name });
+        if (err instanceof OpenRouterServiceError) {
+            // Logged server-side only — the client still gets the generic domain code.
+            // Never logs the API key: openRouterService only ever surfaces status/body snippets.
+            logEvent('aiSmartAdd.callOpenRouter', 'failure', {
+                reason: err.code,
+                httpStatus: err.status,
+                bodySnippet: err.bodySnippet,
+            });
+            const status = err.code === 'NOT_CONFIGURED' ? 500 : 502;
+            throw fail(OPENROUTER_ERROR_TO_DOMAIN_CODE[err.code] || 'AI_SERVICE_REQUEST_FAILED', status);
+        }
+        logEvent('aiSmartAdd.callOpenRouter', 'failure', { reason: 'unexpected_error', errorMessage: err && err.message });
         throw fail('AI_SERVICE_REQUEST_FAILED', 502);
     }
-
-    if (!response.ok) {
-        const bodyText = await response.text().catch(() => '');
-        logEvent('aiSmartAdd.callGroq', 'failure', {
-            reason: 'non_ok_response',
-            httpStatus: response.status,
-            bodySnippet: bodyText.slice(0, 300),
-        });
-        throw fail('AI_SERVICE_REQUEST_FAILED', 502);
-    }
-
-    const payload = await response.json();
-    const content = payload?.choices?.[0]?.message?.content;
-    if (typeof content !== 'string') throw fail('AI_SERVICE_INVALID_RESPONSE', 502);
 
     try {
-        return JSON.parse(content);
+        return JSON.parse(result.content);
     } catch {
         throw fail('AI_SERVICE_INVALID_RESPONSE', 502);
     }
@@ -1086,7 +1084,7 @@ const parsePrompt = async (uid, prompt, context = {}) => {
     }
 
     const { wallets, categories, payees, budgets, recurringPlans } = await getFinanceContext(uid);
-    const aiPayload = await callGroq(prompt, wallets, categories, payees, budgets, recurringPlans, context);
+    const aiPayload = await callAiModel(prompt, wallets, categories, payees, budgets, recurringPlans, context);
     const resolved = resolveAction(normalizeAiAction(aiPayload), wallets, categories, payees);
 
     const now = new Date();
@@ -1145,7 +1143,7 @@ const aiSmartAddHandler = async (request) => {
 // is user finance text, not a secret, but is still left out of the log fields —
 // only the action/intent shape is recorded.
 const aiSmartAdd = onCall(
-    { region: REGION, timeoutSeconds: 60, maxInstances: 10, secrets: [GROQ_API_KEY] },
+    { region: REGION, timeoutSeconds: 60, maxInstances: 10 },
     (request) =>
         withLogging(
             'aiSmartAdd',

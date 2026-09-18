@@ -55,10 +55,10 @@
  *     `users/{uid}.email` picks up the change.
  *
  * `aiSmartAdd` — NOW PORTED.
- *     See src/aiSmartAdd.js + src/aiSmartAddActions.js. Requires the `GROQ_API_KEY`
- *     secret to be set (`firebase functions:secrets:set GROQ_API_KEY`) before the
- *     parse path can actually call the model; auth, Pro-gating, rate limiting and
- *     the confirm/cancel lifecycle all work without it.
+ *     See src/aiSmartAdd.js + src/aiSmartAddActions.js + src/openRouterService.js.
+ *     Requires `OPEN_ROUTER_KEY` (functions/.env, auto-loaded — not a Secret
+ *     Manager secret) before the parse path can actually call the model; auth,
+ *     Pro-gating, rate limiting and the confirm/cancel lifecycle all work without it.
  */
 
 const users = require('./src/users');
