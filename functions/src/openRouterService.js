@@ -9,12 +9,10 @@
 
 const OPENROUTER_BASE_URL = process.env.OPEN_ROUTER_BASE_URL || 'https://openrouter.ai/api/v1';
 
-// No OpenRouter model had been chosen for this project before this integration.
-// openai/gpt-4o-mini is the default: cheap, fast, and one of the few OpenRouter
-// models with reliable `response_format: { type: 'json_object' }` support, which
-// aiSmartAdd.js's structured parsing depends on. Override with OPEN_ROUTER_MODEL
+// z-ai/glm-5.3-flash is the default: supports `response_format: { type: 'json_object' }`,
+// which aiSmartAdd.js's structured parsing depends on. Override with OPEN_ROUTER_MODEL
 // in functions/.env to use a different model.
-const DEFAULT_MODEL = 'openai/gpt-4o-mini';
+const DEFAULT_MODEL = 'z-ai/glm-5.3-flash';
 
 class OpenRouterServiceError extends Error {
     constructor(code, message, extra = {}) {
