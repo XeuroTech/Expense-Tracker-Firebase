@@ -1,0 +1,29 @@
+name: CI
+
+# Sanity-checks backend changes on every PR into main before they can be
+# merged (and therefore before they can reach the testing auto-deploy).
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'functions/**'
+      - 'firestore.rules'
+      - 'firestore.indexes.json'
+      - 'storage.rules'
+
+jobs:
+  install:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install functions dependencies
+        working-directory: functions
+        run: npm ci
