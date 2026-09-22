@@ -1,0 +1,53 @@
+name: Deploy Backend - Testing
+
+# Auto-deploys backend (Cloud Functions + Firestore rules/indexes + Storage
+# rules) to the TESTING/DEV Firebase project (expense-tracker-dev-d2513)
+# whenever backend files change on `main`.
+#
+# This workflow NEVER touches production (expense-tracker-b8db9) — the
+# --project flag below is hardcoded to the testing project on purpose, and
+# the service account behind FIREBASE_TESTING_SA_KEY should only have IAM
+# permissions on the testing project. Production deploy is a separate,
+# manually-triggered workflow (deploy-production.yml) — do not add a prod
+# job here.
+#
+# One-time setup needed before this workflow can run: create a service
+# account scoped to expense-tracker-dev-d2513, grant it Firebase Admin +
+# Service Account User, download its JSON key, and save that key as a
+# GitHub repo secret named FIREBASE_TESTING_SA_KEY (Settings -> Secrets and
+# variables -> Actions -> New repository secret).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'functions/**'
+      - 'firestore.rules'
+      - 'firestore.indexes.json'
+      - 'storage.rules'
+      - '.github/workflows/deploy-testing.yml'
+  workflow_dispatch: {}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install functions dependencies
+        working-directory: functions
+        run: npm ci
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.FIREBASE_TESTING_SA_KEY }}
+
+      - name: Deploy backend to testing project
+        run: npx firebase-tools@latest deploy --only functions,firestore:rules,firestore:indexes,storage --project expense-tracker-dev-d2513 --non-interactive
